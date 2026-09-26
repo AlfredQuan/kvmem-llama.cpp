@@ -2533,7 +2533,8 @@ int main(int argc, char ** argv) {
         try {
             if (image_min_tokens > 0 && image_max_tokens > 0 && image_min_tokens > image_max_tokens)
                 throw std::invalid_argument("image-min-tokens exceeds image-max-tokens");
-            st.vision = std::make_unique<kvmem_vision>(st.model, mmproj_path, mmproj_gpu, image_min_tokens, image_max_tokens);
+            st.vision = std::make_unique<kvmem_vision>(
+                    st.model, mmproj_path, mmproj_gpu, image_min_tokens, image_max_tokens, options.threads);
         } catch (const std::exception & e) {
             fprintf(stderr, "%s\n", e.what());
             return 1;
