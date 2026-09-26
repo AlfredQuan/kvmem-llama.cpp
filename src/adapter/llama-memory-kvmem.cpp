@@ -3206,7 +3206,23 @@ uint32_t llama_memory_kvmem::blend(llama_context * ctx, float ratio, bool batch_
             }
         }
     }
-    if (!plan.added.empty()) apply_selection({attention_epoch_, store_n_tokens(), plan.resident});
+    if (!plan.added.empty()) {
+        // Stage-in occupies whole stored blocks, including the probed Query.
+        // Preserve any suffix already removed for replay, in both caches;
+        // trimming attention cells directly leaves the live GDN state intact.
+        auto live_end = [](const llama_kv_cache * cache) {
+            llama_pos end = 0;
+            const auto & cells = cache->get_cells(0);
+            for (uint32_t i = 0; i < cells.size(); ++i)
+                if (cells.seq_has(i, 0)) end = std::max(end, cells.ext_get(i).logical_pos + 1);
+            return end;
+        };
+        const auto target_end = live_end(kv_);
+        const auto draft_end = mtp_ ? live_end(mtp_->get_kv()) : 0;
+        apply_selection({attention_epoch_, store_n_tokens(), plan.resident});
+        kv_->seq_rm_logical(0, target_end, -1);
+        if (mtp_) mtp_->remove_logical(draft_end, -1);
+    }
     if (trace_) {
         for (const auto & item : {std::make_pair("core", &plan.core), std::make_pair("refresh", &plan.refresh),
                                  std::make_pair("added", &plan.added), std::make_pair("evicted", &plan.evicted)}) {

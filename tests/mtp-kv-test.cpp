@@ -696,6 +696,67 @@ static void check_blend(llama_model * model, ggml_type type, int mtp_state = 0) 
     std::printf("PASS BLEND KV=%s mtp_state=%d tokens=96 runs=2 changed_bytes=%zu: disabled identity, selective rows, immutable source/index, restore, reselect, live recurrent, query replay\n", ggml_type_name(type), mtp_state, changed);
 }
 
+// A neighbor stage-in must not resurrect the Query suffix removed before
+// replay, including in the live MTP follower (not just the target cache).
+static void check_blend_mtp_replay(llama_model * model) {
+    llama_kvmem_params kp{};
+    kp.enabled = true;
+    kp.method = 1;
+    kp.block_tokens = 32;
+    kp.budget = 1024;
+    kp.gen_reserve = 256;
+    kp.query_begin = kp.query_end = kp.force_pos = -1;
+    kp.mtp_state = 2;
+    llama_kvmem_set_params(&kp);
+    auto cp = llama_context_default_params();
+    cp.n_ctx = 2048;
+    cp.n_batch = cp.n_ubatch = 128;
+    cp.n_seq_max = 1;
+    cp.n_rs_seq = 3;
+    cp.type_k = cp.type_v = GGML_TYPE_Q8_0;
+    cp.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
+    std::unique_ptr<llama_context, decltype(&llama_free)> ctx(llama_init_from_model(model, cp), llama_free);
+    require(bool(ctx), "blend MTP context init failed");
+    kvmem_spec_opts opts;
+    opts.kvmem_enabled = true;
+    opts.n_ctx = cp.n_ctx;
+    opts.n_batch = opts.n_ubatch = cp.n_batch;
+    opts.n_max = 3;
+    opts.draft_type = GGML_TYPE_F16;
+    test_spec_session sess;
+    require(kvmem_spec_start(sess, model, ctx.get(), opts), "blend MTP init failed");
+    auto * mtp = dynamic_cast<llama_memory_kvmem_mtp *>(llama_get_memory(sess.ctx_dft));
+    require(mtp != nullptr, "missing blend MTP follower");
+    auto * mem = mtp->target();
+    std::string text;
+    for (int i = 0; i < 36; ++i) text += "Record " + std::to_string(i) + ": the secret code is 7391. Remember this number.\n";
+    auto input = common_tokenize(llama_model_get_vocab(model), text, true, true);
+    const int query = input.size();
+    auto question = common_tokenize(llama_model_get_vocab(model), "What is the secret code?", false, true);
+    input.insert(input.end(), question.begin(), question.end());
+    require(query > 384 && input.size() < 1024, "unexpected blend MTP fixture length");
+    llama_kvmem_set_turn_spans({{{query, (int) input.size()}}, {{query, (int) input.size()}}, query});
+    require(kvmem_spec_decode_span(ctx.get(), sess.spec, input.data(), 0, input.size(), 128, "blend MTP probe") == 0,
+            "blend MTP probe failed");
+    auto selection = llama_kvmem_preview_retrieval();
+    selection.blocks = {0, 3, 5, 6, 9, selection.blocks.back()};
+    llama_kvmem_apply_selection(selection);
+    std::vector<double> scores(mem->store().block_count(), 0);
+    scores[5] = scores[6] = scores[9] = 1;
+    mem->runtime().store().set_retrieval_scores(scores);
+    require(llama_kvmem_remove_logical(ctx.get(), query, -1) &&
+            llama_kvmem_remove_logical(sess.ctx_dft, query, -1), "blend MTP query removal failed");
+    require(mem->blend(ctx.get(), .41f, true, 1, true) == 128, "blend MTP neighbor count differs");
+    for (uint32_t id : {4u, 7u}) require(mem->store().blocks()[id].gpu_slot >= 0, "blend MTP neighbor not staged in");
+    require(mem->get_kv()->seq_pos_max(0) < query && mtp->seq_pos_max(0) < query,
+            "neighbor stage-in resurrected removed Query rows");
+    llama_kvmem_set_replay(true);
+    require(kvmem_spec_decode_span(ctx.get(), sess.spec, input.data(), query, input.size(), 128, "blend MTP replay") == 0,
+            "blend MTP query replay failed");
+    llama_kvmem_set_replay(false);
+    std::puts("PASS BLEND_MTP_REPLAY: cold original neighbors, trimmed target/draft suffix, live MTP replay");
+}
+
 struct gdn_model_result {
     std::vector<float> logits;
     std::vector<uint64_t> states;
@@ -835,6 +896,7 @@ int main(int argc, char ** argv) {
             check_blend(model.get(), GGML_TYPE_F16);
             check_blend(model.get(), GGML_TYPE_Q8_0);
             check_blend(model.get(), GGML_TYPE_Q8_0, 2);
+            check_blend_mtp_replay(model.get());
             llama_kvmem_set_params(nullptr);
             model.reset();
             llama_backend_free();
