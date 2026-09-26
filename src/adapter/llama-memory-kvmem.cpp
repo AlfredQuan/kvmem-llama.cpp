@@ -4,6 +4,7 @@
 #include "llama-memory-kvmem-mtp.h"
 
 #include "llama-kvmem-batch.h"
+#include "llama-kvmem-blend.h"
 #include "llama-kvmem-capture.h"
 #include "llama-kvmem-factory.h"
 #include "llama-kvmem-hooks.h"
@@ -3181,7 +3182,8 @@ void llama_memory_kvmem::blend_restore() {
     blend_blocks_.clear();
 }
 
-uint32_t llama_memory_kvmem::blend(llama_context * ctx, float ratio, bool batch_sparse) {
+uint32_t llama_memory_kvmem::blend(llama_context * ctx, float ratio, bool batch_sparse, float alpha, bool neighbors) {
+    if (!std::isfinite(alpha) || alpha < 0 || alpha > 1) throw std::invalid_argument("KVMem blend alpha must be in [0,1]");
     if (!std::isfinite(ratio) || ratio < 0 || ratio > 1) throw std::invalid_argument("KVMem blend ratio must be in [0,1]");
     if (ratio == 0 || method_ != 1 || !retrieval_pinned_) return 0;
     const auto start = ggml_time_us();
@@ -3193,31 +3195,26 @@ uint32_t llama_memory_kvmem::blend(llama_context * ctx, float ratio, bool batch_
         }
     }
     blend_restore();
-    std::vector<uint32_t> selected;
-    uint32_t window = 0;
-    for (const auto & b : store().blocks()) {
-        if (b.gpu_slot < 0 || b.orig_pos_end() > boundary) continue;
-        // A contiguous prefix has not lost any causal context.
-        if (b.orig_pos_start != window) selected.push_back(b.block_id);
-        window += b.n_tokens;
-    }
-    const uint32_t budget = (uint32_t) std::floor(window * (double) ratio);
-    auto score = [&](uint32_t id) {
-        const auto s = store().blocks()[id].retrieval_score;
-        return std::isfinite(s) ? s : 0.0;
-    };
-    std::sort(selected.begin(), selected.end(), [&](uint32_t a, uint32_t b) {
-        return score(a) != score(b) ? score(a) > score(b) : a < b;
-    });
-    uint32_t tokens = 0;
-    selected.erase(std::remove_if(selected.begin(), selected.end(), [&](uint32_t id) {
-        const auto n = store().blocks()[id].n_tokens;
-        if (n > budget - tokens) return true;
-        tokens += n;
-        return false;
-    }), selected.end());
+    const auto plan = kvmem_plan_blend(store(), boundary, ratio, neighbors, retrieval_mandatory());
+    const auto & selected = plan.refresh;
+    const uint32_t tokens = plan.tokens, window = plan.window_tokens;
     if (selected.empty()) return 0;
-    std::sort(selected.begin(), selected.end());
+    if (alpha < 1) for (int il : kv_->get_layer_ids()) {
+        for (auto * t : {kv_->get_k_storage(il), kv_->get_v_storage(il)}) {
+            if (!t || !kvmem_cuda_tensor_ptr(t) || (t->type != GGML_TYPE_F16 && t->type != GGML_TYPE_Q8_0)) {
+                throw std::runtime_error("KVMem weighted blend requires CUDA F16 or Q8_0 KV");
+            }
+        }
+    }
+    if (!plan.added.empty()) apply_selection({attention_epoch_, store_n_tokens(), plan.resident});
+    if (trace_) {
+        for (const auto & item : {std::make_pair("core", &plan.core), std::make_pair("refresh", &plan.refresh),
+                                 std::make_pair("added", &plan.added), std::make_pair("evicted", &plan.evicted)}) {
+            kvmem_diag("KVMEM_BLEND_PLAN %s", item.first);
+            for (uint32_t id : *item.second) fprintf(stderr, " %u", id);
+            fprintf(stderr, "\n");
+        }
+    }
     llama_synchronize(ctx);
     harvest_flush();
     for (uint32_t id : selected) harvest_gpu_v(id);
@@ -3249,6 +3246,7 @@ uint32_t llama_memory_kvmem::blend(llama_context * ctx, float ratio, bool batch_
     }
     blend_blocks_ = selected;
     const auto prepared = ggml_time_us();
+    int64_t forward_end = prepared;
     try {
         // Hybrid approximation: retain and advance the live recurrent state across
         // selected spans. Query replay continues from this state (no reset/restore).
@@ -3275,6 +3273,28 @@ uint32_t llama_memory_kvmem::blend(llama_context * ctx, float ratio, bool batch_
             ++forwards;
         }
         llama_synchronize(ctx);
+        forward_end = ggml_time_us();
+        // Mix only after ALL forwards: alpha cannot alter later refreshed rows
+        // or recurrent state. Read canonical CPU bytes without updating them.
+        if (alpha < 1) {
+            if (!kvmem_stagein_gpu_ready((size_t) block_tokens_ * std::max(n_embd_k_, n_embd_v_), 1))
+                throw std::runtime_error("KVMem weighted blend scratch allocation failed");
+            std::vector<uint8_t> original;
+            for (uint32_t id : selected) for (int il : kv_->get_layer_ids()) for (bool key : {true, false}) {
+                const auto & b = store().blocks()[id];
+                auto * t = key ? kv_->get_k_storage(il) : kv_->get_v_storage(il);
+                const size_t stride = ggml_row_size(t->type, t->ne[0]);
+                original.resize(b.n_tokens * stride);
+                const bool have = key ? raw_->copy_k_gpu(id, il, original.data(), b.n_tokens) :
+                                        raw_->copy_v_gpu(id, il, original.data(), b.n_tokens);
+                auto * dst = kvmem_cuda_tensor_ptr(t) + b.gpu_slot * (size_t) block_tokens_ * stride;
+                if (!have || !kvmem_stagein_enqueue_mix(t->type, original.data(), original.size(), dst, alpha)) {
+                    throw std::runtime_error("KVMem weighted blend staging failed");
+                }
+            }
+            if (!kvmem_stagein_flush(nullptr, nullptr, nullptr, nullptr)) throw std::runtime_error("KVMem weighted blend flush failed");
+            kvmem_stagein_sync();
+        }
         restore_compute();
     } catch (...) {
         llama_synchronize(ctx);
@@ -3283,17 +3303,18 @@ uint32_t llama_memory_kvmem::blend(llama_context * ctx, float ratio, bool batch_
         throw;
     }
     const auto end = ggml_time_us();
-    kvmem_diag("KVMEM_BLEND tokens=%u window_tokens=%u blocks=%zu runs=%u forwards=%u ratio=%.6f ms=%.3f prepare_ms=%.3f forward_ms=%.3f recurrent=%s source_kv=preserved\n",
+    kvmem_diag("KVMEM_BLEND tokens=%u window_tokens=%u blocks=%zu runs=%u forwards=%u ratio=%.6f ms=%.3f prepare_ms=%.3f forward_ms=%.3f recurrent=%s source_kv=preserved alpha=%.3f neighbors=%d core_blocks=%zu added=%zu evicted=%zu actual_ratio=%.6f mix_ms=%.3f\n",
             tokens, window, selected.size(), runs, forwards, ratio, (end - start) / 1000.0,
-            (prepared - start) / 1000.0, (end - prepared) / 1000.0,
-            recr_ ? "carry" : "none");
+            (prepared - start) / 1000.0, (forward_end - prepared) / 1000.0,
+            recr_ ? "carry" : "none", alpha, (int) neighbors, plan.core.size(), plan.added.size(), plan.evicted.size(),
+            tokens / (double) window, (end - forward_end) / 1000.0);
     return tokens;
 }
 
 uint32_t llama_kvmem_blend(llama_context * ctx) {
     if (g_kvmem_params.blend_ratio == 0) return 0;
     auto * mem = kvmem_capture_active();
-    return mem ? mem->blend(ctx, g_kvmem_params.blend_ratio) : 0;
+    return mem ? mem->blend(ctx, g_kvmem_params.blend_ratio, true, 1-g_kvmem_params.blend_old_weight, g_kvmem_params.blend_neighbors) : 0;
 }
 
 void llama_memory_kvmem::apply_retrieval() {

@@ -110,7 +110,7 @@ public:
     bool selection_fits(const llama_kvmem_selection & selection, uint32_t end, uint32_t generation_rows) const;
     bool commit_unchanged(const llama_kvmem_attention_view & view, const llama_kvmem_selection & selection);
     void apply_selection(const llama_kvmem_selection & selection);
-    uint32_t blend(llama_context * ctx, float ratio, bool batch_sparse = true);
+    uint32_t blend(llama_context * ctx, float ratio, bool batch_sparse = true, float alpha = 1, bool neighbors = false);
     void blend_restore();
     bool blend_active() const { return blend_active_; }
     bool commit_resident(bool canonical = true);

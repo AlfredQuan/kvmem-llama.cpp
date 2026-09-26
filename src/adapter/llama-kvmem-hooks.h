@@ -37,6 +37,8 @@ struct llama_kvmem_params {
     bool     harvest_v;            // prefill D2H V with K (default off; not implied by raw_k_nvme)
     int32_t  mtp_state;            // 0 snapshots, 1 auto, 2 replay
     float    blend_ratio;          // selected-history recomputation fraction; 0 disables
+    float    blend_old_weight;     // 1-alpha; zero initialization preserves direct replacement
+    bool     blend_neighbors;      // add original-history predecessor/successor of each core block
 };
 
 // Call before llama_init_from_model. A null pointer resets to defaults

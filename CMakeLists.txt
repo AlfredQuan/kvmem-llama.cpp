@@ -16,6 +16,12 @@ set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 enable_testing()
 add_subdirectory(kvmem)
 
+add_executable(kvmem-blend-policy-test tests/blend-policy-test.cpp)
+target_include_directories(kvmem-blend-policy-test PRIVATE src/adapter)
+find_package(Threads REQUIRED)
+target_link_libraries(kvmem-blend-policy-test PRIVATE kvmem Threads::Threads)
+add_test(NAME kvmem-blend-policy-test COMMAND kvmem-blend-policy-test)
+
 option(KVMEM_BUILD_LLAMA "Build llama.cpp with the KVMem adapter" ON)
 if (KVMEM_BUILD_LLAMA)
     if (NOT CMAKE_CUDA_COMPILER AND EXISTS "/home/leye/kvmem_qw3/.cu13-env/bin/nvcc")
