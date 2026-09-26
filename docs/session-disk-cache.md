@@ -25,20 +25,20 @@ MTP and the requested output length.
 - `--kvmem-conversations` limits the total number of cached sessions across
   RAM and disk, including the active session. Exceeding it discards the least
   recently used inactive session.
-- `--kvmem-session-ram-gb` aliases `--kvmem-conversations-gb`. With session
-  disk caching enabled, the server reserves capacity **before** a request,
-  accounting for its prompt, maximum output, MTP lookahead, packed KV and
-  recurrent checkpoints. An individual request larger than the RAM allowance
-  returns HTTP 400 before changing the cache.
+- `--kvmem-session-ram-gb` aliases `--kvmem-conversations-gb`: both are a **soft
+  limit on active plus inactive session RAM**, with or without NVMe. `0` means
+  unlimited. An active session larger than the limit continues serving and
+  produces a warning. Idle payloads are moved out first; necessary cold metadata
+  remains accounted, even when active KV plus that metadata exceeds the limit.
 - To free RAM, the least recently used inactive RAM session moves to disk.
-  If disk space/quota is insufficient, disk sessions are discarded in LRU
-  order. A session larger than the disk quota is discarded when it must leave
-  RAM. A failed write keeps the original RAM state until ordinary LRU eviction
-  can discard it; a failed deletion keeps its quota charge.
+  Only insufficient **final** disk space/quota permits LRU eviction. The target's
+  files are credited as space freed by restoring it. Temporary transfer pressure
+  and I/O failures preserve caches; they are not treated as eviction requests.
+  A failed deletion keeps its quota charge. The session count cap still applies.
 - File size includes metadata, checksum and temporary writes. Space is reserved
   before writing. RAM includes retained KV, means, block/position metadata,
   token indexes, query state and recurrent/MTP checkpoints. Cold entries still
-  need a small RAM index, which also counts toward the cap.
+  need RAM indexes and a frozen allocation manifest, which count toward the cap.
 - Touching a session on an accepted request updates its LRU timestamp. Moving
   it between tiers does not. The target and the active request are protected
   from eviction.
@@ -46,11 +46,13 @@ MTP and the requested output length.
 The RAM limit describes session storage, **not process RSS**. Model weights,
 the GPU working set, backend transfer/compute buffers, the current HTTP request
 and media encoder buffers, allocator overhead, and the OS file page cache need
-additional memory. Admission is conservative and may reject a request whose
-eventual short generation would have fitted.
+additional memory. Retention uses measured RAM and actual restore sizes, rather
+than the conservative future prompt/output estimate printed in diagnostics.
+Exceeding the soft limit does not reject a request. The active session must fit
+the machine's actual RAM; this setting cannot guarantee protection from OOM.
 
 Disk mode requires KVMem, flash attention, `--kvmem-conversations > 1`, a
-positive RAM cap, and an explicit cache directory. Leave `--kvmem-cpu-gb` and
+an explicit cache directory. Leave `--kvmem-cpu-gb` and
 `--kvmem-nvme-gb` at zero and do not enable `--kvmem-raw-k-nvme`: those older
 options allocate separate block-tier arenas per session. This session file
 cache works on Windows as well as POSIX and does not depend on the older
@@ -61,19 +63,46 @@ the original RAM cap is a soft retention cap and allows a larger active store.
 
 ## Save and restore
 
-The adapter drains pending GPU transfers before detaching a session, then
-moves ownership of the existing host store. It does not make another complete
-KV copy. The file writer streams existing packed main KV, MTP KV, exact F32
-mean sums, recurrent states and speculative carry. Shared checkpoints are
-stored once. Each raw block has a section length; format/configuration, vector
-bounds, token counts, file length and a whole-file checksum are checked.
+The adapter drains pending GPU transfers before detaching a session, then moves
+ownership of the existing host store without copying the entire KV. Detached
+stores are frozen while their allocations migrate. Packed main/MTP KV, exact
+F32 mean sums, recurrent states and speculative carry are all included. Shared
+checkpoints are indexed once. Model configuration, vector lengths, raw block
+metadata and checkpoint references remain in the trusted process-local manifest.
 
-A switch to a cold session first parks the outgoing session in a valid empty
-execution context. RAM is freed before the incoming payload is read. Loading
-uses bounded I/O chunks and allocates the destination store directly. Failed
-or corrupt snapshots become cache misses, so the prompt is recomputed instead
-of using incomplete KV. The stored media index uses llama.cpp's placeholder
-chunks; incoming request data supplies media if a span must be replayed.
+Each file contains a group of complete allocations (normally up to 16 MiB),
+with a session id, generation, chunk index, exact lengths and checksum. A single
+larger allocation, such as a recurrent checkpoint, stays an indivisible unit;
+the planner includes its full restore footprint. I/O calls are bounded to 1 MiB.
+No full-session serialization buffer is created. Source memory is released
+only after publishing its chunk; source files are removed only after the whole
+chunk is read and validated. Files are independently reclaimable.
+
+Before migration, the planner checks the final layout and schedules every move:
+
+1. With sufficient disk workspace, spill outgoing payloads before restoring.
+2. With sufficient actual RAM workspace, restore first to reclaim target files.
+3. Otherwise, alternate chunk writes and reads, reclaiming each source in turn.
+
+For example, RAM A=10 GiB and disk B=15 GiB with a 20 GiB disk quota can end as
+RAM B=15 GiB and disk A=10 GiB, even with a 12 GiB RAM soft limit. It does not
+require simultaneous complete 25 GiB copies in either tier. The planner uses
+OS physical/commit headroom with a safety margin, separately from the soft cap.
+It rechecks RAM before each restore and disk space before each write. These are
+observations, not reservations against other processes or an OOM guarantee.
+
+If no safe schedule fits even one allocation, switching returns HTTP 503 with
+the caches retained. A mid-transfer I/O/allocation failure likewise leaves a
+mixed RAM/disk manifest: a subsequent request can resume either session. There
+is no promise of immediately returning all of the old session to RAM after a
+failure. The adapter refuses to attach a frozen/partial session. Only complete
+restoration allows thawing and attachment. A corrupt target is discarded and
+recomputed; unrelated and outgoing sessions retain their own KV. Optional idle
+demotion failures do not fail a hot request or clear its completed active cache.
+
+The stored media index uses llama.cpp's placeholder chunks; incoming request
+data supplies media if a span must be replayed. This transfer recovery is within
+one running process, not durable restart or power-loss recovery.
 
 These files are **only valid within the same server run**. Their small in-memory
 indexes include model/runtime identity. Each run creates a unique subdirectory
@@ -90,19 +119,27 @@ per-block paging of an active session are outside this implementation.
 `/slots` → `kvmem.conversations` reports RAM `bytes`/`bytes_max`,
 `disk_bytes`/`disk_bytes_max`, `spills`, `restores`, `disk_errors`, and the existing
 session/eviction counters. `--kvmem-trace` adds `session_select`, `session_spill`
-and `session_restore` events.
+and `session_restore` events, plus `session_transfer` with the chosen path and
+planned peak/final disk bytes. RAM `bytes` may exceed its soft `bytes_max`.
 
 Portable tests (no model required):
 
 ```text
 cmake -S . -B build-session-host -DKVMEM_BUILD_LLAMA=OFF
-cmake --build build-session-host --target kvmem-session-snapshot-test kvmem-conversation-store-test
-ctest --test-dir build-session-host --output-on-failure -R "kvmem-(session-snapshot|conversation-store)-test"
+cmake --build build-session-host --target kvmem-session-transfer-test kvmem-session-snapshot-test kvmem-conversation-store-test
+ctest --test-dir build-session-host --output-on-failure -R "kvmem-(session-transfer|session-snapshot|conversation-store)-test"
 ```
 
 The snapshot test also accepts `--large-file` for an explicit >4 GiB streaming
 roundtrip using a 1 MiB buffer. It temporarily needs just over 4 GiB of free
 space and removes its files when it finishes.
+
+The transfer test scales the 10/15/20 GiB scenario to MiB and measures actual
+vector allocations and charged disk bytes. It covers all three schedules,
+insufficient temporary workspace without mutation, failures at each chunk's
+write/rename/read/validation/deletion boundary, partial I/O within a multi-vector
+chunk, failed temporary-file cleanup, wrong-session headers, bad checksums,
+decreasing available RAM, reverse recovery and exact packed KV restoration.
 
 Real model regression, including interleaved A/B/C histories, exact answers
 against a RAM reference, prefix cache hits, corruption fallback and eviction:
@@ -111,24 +148,31 @@ against a RAM reference, prefix cache hits, corruption fallback and eviction:
 python scripts/test_server_session_disk.py --server PATH/llama-kvmem-server --model PATH/model.gguf --output artifacts/session-disk
 ```
 
-Add `--mtp` for a model with an MTP head. The script starts only its own server
-processes on unused ports and downloads no models.
+Add `--mtp` for a model with an MTP head. Use `--mtp-state snapshots` for models
+outside the specialized 27B replay kernel (for example the local 0.8B model).
+The script starts only its own server processes on unused ports and downloads
+no models. On Windows it also locks a middle snapshot chunk to force a real
+HTTP 503, resumes the old session, and retries the target with cache hits intact.
 
 ### Local verification (Windows, 2026-09-26)
 
-- Built with MSVC 19.44 and CUDA 12.9.86 for the local RTX 5050/5060 Ti.
-- Snapshot, conversation-policy and server-options CTest targets passed.
-- A >4 GiB file roundtrip passed with a 1 MiB I/O buffer.
+- Built with MSVC 19.44 and CUDA 12.9.86; this revision's GPU tests use RTX 5050.
+- Transfer, snapshot, conversation-policy and server-options CTest targets passed.
+- The earlier streaming implementation's >4 GiB file test remains available.
 - Qwen3.5-0.8B Q8_0: interleaved A/B/C disk restores preserved answers and
-  resumed 5,579–5,580 prefix tokens. Capacity rejection, corrupt-file fallback
-  and quota eviction passed.
-- Qwen3.8-27B IQ3_S with MTP: disk restores matched the RAM reference exactly,
-  resuming 6,106–6,108 tokens. The one-file disk-quota case retained the more
-  recent B session and discarded A. Corruption and undersized-disk cases passed.
-  The roundtrip fixture used a 1,563,079,285-byte RAM allowance; retained session
-  bytes stayed below 882,029,335, with two cold files totaling up to 1,742,224,146
-  bytes. These are session counters, not RSS.
-- The original RAM-only regression passed, including count LRU, byte-cap
+  resumed 5,579–5,580 prefix tokens. The updated regression sets the RAM soft
+  limit below one active session and covers successful requests, corrupt/missing
+  files, locked-file recovery, quota eviction and unlimited RAM. It also checks
+  that pessimistic capacity forecasts do not demote sessions whose actual RAM fits.
+  All 150 checks passed.
+- The same 0.8B model with MTP (`--mtp-state snapshots`) preserves answers and
+  cached prefixes across main/MTP KV and recurrent/carry restoration. Its initial
+  soft cap was about 82 MiB while retained RAM reached about 130 MiB; requests
+  still succeeded. These are session counters, not RSS. The specialized 27B
+  replay mode was not rerun in this revision: the 16 GiB GPU was in use.
+- All 159 MTP checks passed, including evidence that the MTP follower ran in
+  every fixture and recovery after a partially completed restore.
+- The original RAM-only regression passed all 119 checks, including count LRU, byte-cap
   eviction and rejected-request isolation. Its fixed 90% hit assertion was
   corrected to allow the existing non-MTP query-checkpoint replay (512 tokens
   plus template slack); the test still requires a substantial cached prefix.

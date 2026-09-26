@@ -22,6 +22,7 @@ namespace kvmem {
 class NvmeKvTier;
 class SnapshotWriter;
 class SnapshotReader;
+struct SnapshotBuffer;
 
 struct RawKvStoreConfig {
     uint32_t n_layer = 0;
@@ -86,6 +87,8 @@ public:
     uint64_t capacity_bytes(uint32_t tokens, uint32_t populated_layers = UINT32_MAX) const;
     void snapshot_write(SnapshotWriter & out);
     void snapshot_read(SnapshotReader & in, uint32_t max_blocks);
+    // Caller freezes the detached store until all bindings have been restored.
+    void snapshot_buffers(std::vector<SnapshotBuffer> & buffers);
 
     uint64_t nvme_bytes_written() const;
     uint64_t nvme_syscalls() const;

@@ -21,6 +21,7 @@
 
 #include "llama.h"
 #include "kvmem/snapshot.hpp"
+#include "kvmem/snapshot_buffer.hpp"
 
 #include "ggml-backend.h"
 #include "ggml-backend-impl.h"
@@ -4688,6 +4689,18 @@ static llama_memory_kvmem::ConvStore & kvmem_detached(int32_t id) {
     auto * e = kvmem_conv_find(id);
     if (!e || !e->store) throw std::runtime_error("unknown detached session store");
     return *e->store;
+}
+
+void llama_kvmem_store_freeze(int32_t id, std::vector<kvmem::SnapshotBuffer> & buffers) {
+    auto & s = kvmem_detached(id);
+    if (s.cold) throw std::runtime_error("session is already frozen");
+    s.raw->snapshot_buffers(buffers);
+    if (s.mtp_raw) s.mtp_raw->snapshot_buffers(buffers);
+    s.cold = true; // partial stores must never be attached to inference
+}
+
+void llama_kvmem_store_thaw(int32_t id) {
+    kvmem_detached(id).cold = false;
 }
 
 void llama_kvmem_store_snapshot_write(int32_t id, kvmem::SnapshotWriter & out) {

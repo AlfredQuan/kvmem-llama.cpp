@@ -1,5 +1,6 @@
 #include "kvmem/raw_kv_store.hpp"
 #include "kvmem/snapshot.hpp"
+#include "kvmem/snapshot_buffer.hpp"
 #if defined(_WIN32)
 // The POSIX implementation cannot be built on Windows; see the header.
 #include "kvmem/nvme_kv_tier_win.hpp"
@@ -1204,6 +1205,21 @@ uint64_t RawKvStore::capacity_bytes(uint32_t tokens, uint32_t populated_layers) 
     return sizeof(*this) + blocks * (2*sizeof(BlockRaw) + cfg_.n_layer*sizeof(LayerBlk) +
         std::min(populated_layers, cfg_.n_layer) * (cfg_.n_embd_k*sizeof(float) + uint64_t(cfg_.block_tokens) *
          (cfg_.k_gpu_row_bytes + cfg_.v_gpu_row_bytes)));
+}
+
+void RawKvStore::snapshot_buffers(std::vector<SnapshotBuffer> & buffers) {
+    wait_writes();
+    std::lock_guard<std::mutex> lk(mu_);
+    if (nvme_) throw std::runtime_error("session snapshots require RAM raw stores");
+    for (auto & b : blocks_) for (auto & l : b.layers) {
+        // All lengths, token counts, formats and runtime identity stay in RAM.
+        // Empty allocations can be reclaimed too, without serializing capacity.
+        if (l.k.capacity()) buffers.push_back(SnapshotBuffer::bind(l.k));
+        if (l.v.capacity()) buffers.push_back(SnapshotBuffer::bind(l.v));
+        if (l.k_gpu.capacity()) buffers.push_back(SnapshotBuffer::bind(l.k_gpu));
+        if (l.v_gpu.capacity()) buffers.push_back(SnapshotBuffer::bind(l.v_gpu));
+        if (l.k_sum.capacity()) buffers.push_back(SnapshotBuffer::bind(l.k_sum));
+    }
 }
 
 void RawKvStore::snapshot_write(SnapshotWriter & out) {

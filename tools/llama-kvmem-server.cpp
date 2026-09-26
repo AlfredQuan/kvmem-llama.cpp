@@ -15,6 +15,8 @@
 #include "kvmem-prefill-policy.h"
 #include "kvmem-conversation-store.h"
 #include "kvmem-session-files.h"
+#include "kvmem-session-transfer.h"
+#include "kvmem/session_memory.hpp"
 
 #include "chat.h"
 #include "common.h"
@@ -129,9 +131,9 @@ static void print_usage(const char * argv0) {
             "  --kvmem-raw-k-nvme         store raw-K and V on NVMe (needs --kvmem-nvme-gb)\n"
             "  --kvmem-conversations N    live host KV stores, time-multiplexed on one GPU\n"
             "                            working set (default 1 = today's single store)\n"
-            "  --kvmem-conversations-gb GB cap total accounted host store bytes, evicting the\n"
-            "                            least recently used conversation (0 = count cap only)\n"
-            "  --kvmem-session-ram-gb GB  alias for the RAM cap; required with session NVMe\n"
+            "  --kvmem-conversations-gb GB soft cap on total active + idle session RAM, moving\n"
+            "                            idle KV by LRU (0 = unlimited; active may exceed cap)\n"
+            "  --kvmem-session-ram-gb GB  alias for the RAM soft cap\n"
             "  --kvmem-session-nvme-gb GB disk quota for inactive sessions (default 0 = off)\n"
             "  --kvmem-session-cache-dir PATH private cache directory on your NVMe/SSD\n"
             "                            LRU RAM -> disk -> discard; active session must fit RAM\n"
@@ -236,7 +238,7 @@ struct MultimodalQuery {
 struct kvmem_conversation {
     bool cold = false;
     bool disk_gen = false, disk_query = false;
-    uint64_t restore_bytes = 0;
+    std::unique_ptr<kvmem_session_payload> payload; // frozen RAM/disk allocation manifest
     std::string client_id;  // bound kvmem.conversation_id; empty = inferred
     uint32_t stored = 0;    // llama_kvmem_store_n_tokens() at the last commit
     std::vector<llama_token> cached_tokens;
@@ -369,6 +371,7 @@ struct ServerState {
     kvmem_conv_counts conv_counts;
     kvmem_conv_stats conv_stats;
     std::unique_ptr<kvmem_session_files> session_files;
+    uint64_t session_generation = 0;
 };
 
 struct StreamIo {
@@ -554,6 +557,7 @@ static uint64_t conversation_bytes(const ServerState & st, int id) {
     bytes += (uint64_t) tokens.capacity() * sizeof(llama_token);
     const auto & conv = entry->second;
     bytes += sizeof(kvmem_conversation) + conv.client_id.capacity();
+    if (conv.payload) bytes += conv.payload->metadata_bytes();
     bytes += (active ? st.gdn_ckpt : conv.gdn_ckpt).capacity();
     bytes += (active ? st.gdn_carry : conv.gdn_carry).capacity();
     bytes += (active ? st.gdn_query_carry : conv.gdn_query_carry).capacity();
@@ -585,6 +589,7 @@ static kvmem_store_match conversation_match(const ServerState & st, int id, cons
         return match;
     }
     const kvmem_conversation & conv = entry->second;
+    if (conv.payload && conv.payload->invalid) return match;
     const bool active = id == st.conv_active;
     match.used = held->used;
     // The accounted figure from that conversation's last commit, not a fresh
@@ -658,6 +663,8 @@ static bool conversation_evict(ServerState & st, int id, const char * reason) {
     const uint32_t rows = st.kparams.enabled ? llama_kvmem_store_rows(held->store_id) : 0;
     const uint64_t bytes = conversation_bytes(st, id);
     const int32_t store_id = held->store_id;
+    // Partial deletion must never leave a selectable cache with missing KV.
+    if (st.conv.at(id).payload) st.conv.at(id).payload->invalid = true;
     if (st.session_files && !st.session_files->erase(id)) {
         ++st.conv_counts.disk_errors;
         LOG_WRN("srv    KVMEM cannot remove session file id=%d; retaining quota charge\n", id);
@@ -715,14 +722,7 @@ static void conversation_enforce_budget(ServerState & st) {
         return;
     }
     if (st.session_files) {
-        if (!session_make_room(st, st.conv_active, conversation_bytes(st, st.conv_active))) {
-            // Defensive backstop if an accounting assumption ever changes:
-            // discard this completed cache, never retain it above the cap.
-            LOG_ERR("srv    KVMEM session RAM reservation exhausted; clearing completed cache\n");
-            memory_clear_all(st);
-            { kvmem_conversation released; conversation_swap(st, released); }
-            st.conv_table.set_bytes(st.conv_active, conversation_bytes(st, st.conv_active));
-        }
+        session_make_room(st, st.conv_active);
         return;
     }
     while (st.conv_table.count() > st.conv_limits.max_stores) {
@@ -2402,9 +2402,9 @@ int main(int argc, char ** argv) {
                                     "--kvmem-conversations N creates; pass N > 1 or drop the cap");
     }
     if (options.session_disk_bytes) {
-        if (options.conversations <= 1 || !options.conversation_bytes || options.session_cache_dir.empty())
+        if (options.conversations <= 1 || options.session_cache_dir.empty())
             throw std::invalid_argument("session disk cache requires --kvmem-conversations N > 1, "
-                "--kvmem-session-ram-gb > 0 and --kvmem-session-cache-dir PATH");
+                "and --kvmem-session-cache-dir PATH");
         if (st.kparams.cpu_bytes || st.kparams.nvme_bytes || st.kparams.raw_k_nvme)
             throw std::invalid_argument("session disk cache requires --kvmem-cpu-gb 0 and --kvmem-nvme-gb 0; "
                 "do not combine it with --kvmem-raw-k-nvme");
@@ -2629,8 +2629,6 @@ int main(int argc, char ** argv) {
                 try {
                     st.session_files = std::make_unique<kvmem_session_files>(
                         std::filesystem::u8path(options.session_cache_dir), options.session_disk_bytes);
-                    if (llama_kvmem_store_capacity(0) > options.conversation_bytes)
-                        throw std::runtime_error("session RAM cap is smaller than the model's minimum checkpoint reservation");
                 } catch (const std::exception & e) {
                     LOG_ERR("srv    KVMEM session cache initialization failed: %s\n", e.what()); return 1;
                 }

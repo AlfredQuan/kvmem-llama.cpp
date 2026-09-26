@@ -43,6 +43,11 @@ target_include_directories(kvmem-session-snapshot-test PRIVATE tools)
 target_link_libraries(kvmem-session-snapshot-test PRIVATE kvmem)
 add_test(NAME kvmem-session-snapshot-test COMMAND kvmem-session-snapshot-test)
 
+add_executable(kvmem-session-transfer-test tests/session-transfer-test.cpp)
+target_include_directories(kvmem-session-transfer-test PRIVATE tools)
+target_link_libraries(kvmem-session-transfer-test PRIVATE kvmem)
+add_test(NAME kvmem-session-transfer-test COMMAND kvmem-session-transfer-test)
+
 option(KVMEM_BUILD_LLAMA "Build llama.cpp with the KVMem adapter" ON)
 option(KVMEM_ROCM "Build KVMem with the HIP/ROCm backend" OFF)
 if (KVMEM_ROCM)
