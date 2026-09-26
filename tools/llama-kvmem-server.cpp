@@ -14,6 +14,7 @@
 #include "kvmem-vision.h"
 #include "kvmem-prefill-policy.h"
 #include "kvmem-conversation-store.h"
+#include "kvmem-session-files.h"
 
 #include "chat.h"
 #include "common.h"
@@ -130,6 +131,10 @@ static void print_usage(const char * argv0) {
             "                            working set (default 1 = today's single store)\n"
             "  --kvmem-conversations-gb GB cap total accounted host store bytes, evicting the\n"
             "                            least recently used conversation (0 = count cap only)\n"
+            "  --kvmem-session-ram-gb GB  alias for the RAM cap; required with session NVMe\n"
+            "  --kvmem-session-nvme-gb GB disk quota for inactive sessions (default 0 = off)\n"
+            "  --kvmem-session-cache-dir PATH private cache directory on your NVMe/SSD\n"
+            "                            LRU RAM -> disk -> discard; active session must fit RAM\n"
             "  --kv-dtype NAME            GPU KV cache type for K and V: f16 | f32 | q8_0 | q5_0 | q4_0 (default q8_0)\n"
             "  -ctk, --cache-type-k TYPE  GPU K cache type (llama.cpp name; default q8_0)\n"
             "  -ctv, --cache-type-v TYPE  GPU V cache type (quantized: independently q8_0 | q5_0 | q4_0)\n"
@@ -229,6 +234,9 @@ struct MultimodalQuery {
 // new one added to ServerState and forgotten there would leak state across
 // conversations, so the struct and the swap belong in view of each other.
 struct kvmem_conversation {
+    bool cold = false;
+    bool disk_gen = false, disk_query = false;
+    uint64_t restore_bytes = 0;
     std::string client_id;  // bound kvmem.conversation_id; empty = inferred
     uint32_t stored = 0;    // llama_kvmem_store_n_tokens() at the last commit
     std::vector<llama_token> cached_tokens;
@@ -249,6 +257,8 @@ struct kvmem_conversation {
 };
 
 struct kvmem_conv_counts {
+    uint64_t disk_bytes = 0, disk_bytes_max = 0;
+    uint64_t spills = 0, restores = 0, disk_errors = 0;
     int count = 1;
     int max = 1;
     int active = 0;
@@ -358,6 +368,7 @@ struct ServerState {
     std::string turn_conversation_id;
     kvmem_conv_counts conv_counts;
     kvmem_conv_stats conv_stats;
+    std::unique_ptr<kvmem_session_files> session_files;
 };
 
 struct StreamIo {
@@ -537,8 +548,28 @@ static uint64_t conversation_bytes(const ServerState & st, int id) {
             bytes += checkpoint.data->bytes();
         }
     }
+    const auto & live = active ? st.mm_live_checkpoint : entry->second.mm_live_checkpoint;
+    if (live && unique.insert(live.get()).second) bytes += live->bytes();
     const auto & tokens = active ? st.cached_tokens : entry->second.cached_tokens;
-    bytes += (uint64_t) tokens.size() * sizeof(llama_token);
+    bytes += (uint64_t) tokens.capacity() * sizeof(llama_token);
+    const auto & conv = entry->second;
+    bytes += sizeof(kvmem_conversation) + conv.client_id.capacity();
+    bytes += (active ? st.gdn_ckpt : conv.gdn_ckpt).capacity();
+    bytes += (active ? st.gdn_carry : conv.gdn_carry).capacity();
+    bytes += (active ? st.gdn_query_carry : conv.gdn_query_carry).capacity();
+    bytes += (active ? st.gdn_ckpt_query : conv.gdn_ckpt_query).capacity();
+    bytes += (active ? st.last_user_text : conv.last_user_text).capacity();
+    bytes += checkpoints.capacity()*sizeof(MultimodalCheckpoint);
+    const auto & prompt = active ? st.cached_prompt : conv.cached_prompt;
+    if (prompt) bytes += prompt->index_bytes();
+    const auto & query = active ? st.mm_query : conv.mm_query;
+    if (query) {
+        bytes += sizeof(MultimodalQuery) + query->user.capacity() + query->state.count.capacity()*sizeof(uint32_t);
+        bytes += query->state.sum.capacity()*sizeof(std::vector<float>);
+        for (const auto & sum : query->state.sum) bytes += sum.capacity()*sizeof(float);
+        if (query->prefix && query->prefix != prompt) bytes += query->prefix->index_bytes();
+        for (const auto & media : query->media) bytes += sizeof(media) + media.second.capacity();
+    }
     return bytes;
 }
 
@@ -589,8 +620,8 @@ static kvmem_store_match conversation_match(const ServerState & st, int id, cons
         } else {
             const int gen_start = active ? st.gdn_ckpt_pos : conv.gdn_ckpt_pos;
             const int query = active ? st.gdn_ckpt_query_pos : conv.gdn_ckpt_query_pos;
-            const bool have_gen = !(active ? st.gdn_ckpt : conv.gdn_ckpt).empty();
-            const bool have_query = !(active ? st.gdn_ckpt_query : conv.gdn_ckpt_query).empty();
+            const bool have_gen = !(active ? st.gdn_ckpt : conv.gdn_ckpt).empty() || (!active && conv.cold && conv.disk_gen);
+            const bool have_query = !(active ? st.gdn_ckpt_query : conv.gdn_ckpt_query).empty() || (!active && conv.cold && conv.disk_query);
             if (gen_start >= 0 && have_gen) {
                 match.ckpt_rows.push_back(gen_start + 1);
             }
@@ -627,6 +658,11 @@ static bool conversation_evict(ServerState & st, int id, const char * reason) {
     const uint32_t rows = st.kparams.enabled ? llama_kvmem_store_rows(held->store_id) : 0;
     const uint64_t bytes = conversation_bytes(st, id);
     const int32_t store_id = held->store_id;
+    if (st.session_files && !st.session_files->erase(id)) {
+        ++st.conv_counts.disk_errors;
+        LOG_WRN("srv    KVMEM cannot remove session file id=%d; retaining quota charge\n", id);
+        return false;
+    }
     if (st.kparams.enabled && !llama_kvmem_store_destroy(store_id)) {
         // Dropping the row anyway would leave the bundle in the adapter's pool
         // with nothing naming it: one runtime with its pinned arena and two
@@ -663,13 +699,30 @@ static void conversation_publish(ServerState & st) {
     st.conv_counts.active = st.conv_active;
     st.conv_counts.bytes = st.conv_table.bytes_total();
     st.conv_counts.bytes_max = st.conv_limits.max_bytes;
+    if (st.session_files) {
+        st.conv_counts.disk_bytes = st.session_files->bytes();
+        st.conv_counts.disk_bytes_max = st.session_files->limit();
+    }
     st.conv_stats.publish(st.conv_counts);
 }
 
-// Runs after the reply is sent, when the conversation's footprint is final for
-// the turn, so eviction stays off the latency path.
+static void memory_clear_all(ServerState & st);
+#include "kvmem-session-cache.h"
+
+// Runs when the conversation's footprint is final for the committed turn.
 static void conversation_enforce_budget(ServerState & st) {
     if (st.conv_limits.max_stores <= 1) {
+        return;
+    }
+    if (st.session_files) {
+        if (!session_make_room(st, st.conv_active, conversation_bytes(st, st.conv_active))) {
+            // Defensive backstop if an accounting assumption ever changes:
+            // discard this completed cache, never retain it above the cap.
+            LOG_ERR("srv    KVMEM session RAM reservation exhausted; clearing completed cache\n");
+            memory_clear_all(st);
+            { kvmem_conversation released; conversation_swap(st, released); }
+            st.conv_table.set_bytes(st.conv_active, conversation_bytes(st, st.conv_active));
+        }
         return;
     }
     while (st.conv_table.count() > st.conv_limits.max_stores) {
@@ -705,6 +758,13 @@ static void conversation_commit(ServerState & st, uint32_t stored) {
     const auto entry = st.conv.find(st.conv_active);
     if (entry == st.conv.end()) {
         return;
+    }
+    if (st.session_files) {
+        if (st.cached_prompt && st.cached_prompt->has_media()) st.cached_prompt = st.cached_prompt->cache_index();
+        if (st.mm_query && st.mm_query->prefix && st.mm_query->prefix->has_media()) {
+            auto query = std::make_shared<MultimodalQuery>(*st.mm_query);
+            query->prefix = query->prefix->cache_index(); st.mm_query = std::move(query);
+        }
     }
     entry->second.stored = stored;
     if (!st.turn_conversation_id.empty()) {
@@ -2341,6 +2401,16 @@ int main(int argc, char ** argv) {
         throw std::invalid_argument("--kvmem-conversations-gb caps the host stores that "
                                     "--kvmem-conversations N creates; pass N > 1 or drop the cap");
     }
+    if (options.session_disk_bytes) {
+        if (options.conversations <= 1 || !options.conversation_bytes || options.session_cache_dir.empty())
+            throw std::invalid_argument("session disk cache requires --kvmem-conversations N > 1, "
+                "--kvmem-session-ram-gb > 0 and --kvmem-session-cache-dir PATH");
+        if (st.kparams.cpu_bytes || st.kparams.nvme_bytes || st.kparams.raw_k_nvme)
+            throw std::invalid_argument("session disk cache requires --kvmem-cpu-gb 0 and --kvmem-nvme-gb 0; "
+                "do not combine it with --kvmem-raw-k-nvme");
+    } else if (!options.session_cache_dir.empty()) {
+        throw std::invalid_argument("--kvmem-session-cache-dir requires --kvmem-session-nvme-gb > 0");
+    }
     // Some pinned llama.cpp trace sites test presence rather than the value.
     // Normalize "0"/empty and CLI-off to an absent variable before loading models.
     const bool trace = options.trace == -1 ? kvmem_diag_enabled() : options.trace != 0;
@@ -2546,11 +2616,27 @@ int main(int argc, char ** argv) {
     // attention is resolved inside llama_init_from_model, not at parse time.
     if (options.conversations > 1) {
         if (!llama_kvmem_store_swap_supported()) {
+            if (options.session_disk_bytes) {
+                LOG_ERR("srv    KVMEM session disk cache requires supported session switching (flash attention on)\n");
+                return 1;
+            }
             LOG_WRN("srv    KVMEM --kvmem-conversations %d unavailable in this configuration; "
                     "using one host store\n", options.conversations);
         } else {
             st.conv_limits.max_stores = options.conversations;
             st.conv_limits.max_bytes = options.conversation_bytes;
+            if (options.session_disk_bytes) {
+                try {
+                    st.session_files = std::make_unique<kvmem_session_files>(
+                        std::filesystem::u8path(options.session_cache_dir), options.session_disk_bytes);
+                    if (llama_kvmem_store_capacity(0) > options.conversation_bytes)
+                        throw std::runtime_error("session RAM cap is smaller than the model's minimum checkpoint reservation");
+                } catch (const std::exception & e) {
+                    LOG_ERR("srv    KVMEM session cache initialization failed: %s\n", e.what()); return 1;
+                }
+                LOG_INF("srv    KVMEM session disk cache=%s quota=%llu bytes\n", st.session_files->directory().u8string().c_str(),
+                    (unsigned long long)options.session_disk_bytes);
+            }
             st.conv_active = st.conv_table.add(llama_kvmem_store_current());
             st.conv.emplace(st.conv_active, kvmem_conversation{});
             st.conv_table.touch(st.conv_active, ++st.conv_clock);
@@ -2719,6 +2805,12 @@ int main(int argc, char ** argv) {
                 {"resets", conv.resets},
                 {"evictions", conv.evictions},
                 {"switches", conv.switches}}}};
+            auto & sessions = slot["kvmem"]["conversations"];
+            sessions["disk_bytes"] = conv.disk_bytes;
+            sessions["disk_bytes_max"] = conv.disk_bytes_max;
+            sessions["spills"] = conv.spills;
+            sessions["restores"] = conv.restores;
+            sessions["disk_errors"] = conv.disk_errors;
         }
         if (busy && req.has_param("fail_on_no_slot")) {
             res.status = 503;
@@ -2907,7 +2999,17 @@ int main(int argc, char ** argv) {
         // derivation and here reads a field conversation_swap() exchanges.
         // No-op with one host store.
         st.turn_conversation_id = cr.conversation_id;
-        conversation_begin_request(st, *parsed_prompt, cr.conversation_id);
+        try {
+            if (st.session_files) session_begin_request(st, *parsed_prompt, cr.conversation_id, cr.max_tokens);
+            else conversation_begin_request(st, *parsed_prompt, cr.conversation_id);
+        } catch (const std::invalid_argument & e) {
+            res.status = 400;
+            res.set_content(json{{"error", e.what()}}.dump(), "application/json"); return;
+        } catch (const std::exception & e) {
+            conversation_publish(st);
+            res.status = 503;
+            res.set_content(json{{"error", e.what()}}.dump(), "application/json"); return;
+        }
 
         const int force = force_pos_from_substr(st.vocab, toks, cr.force_substr);
         st.kparams.query_begin = qbegin;

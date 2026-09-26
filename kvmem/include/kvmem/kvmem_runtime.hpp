@@ -42,6 +42,14 @@ public:
     // True while a prepared plan has not been applied yet (prepare_selection /
     // prepare_prefill_pressure set it, admit_incoming clears it).
     bool pending() const { return pending_; }
+    size_t allocated_bytes() const {
+        size_t bytes = sizeof(*this) + store_.allocated_bytes() + cpu_arena_.capacity() + scratch_.capacity();
+        bytes += last_plan_.stage_in.capacity()*sizeof(uint32_t) +
+            last_plan_.stage_out.capacity()*sizeof(uint32_t) + last_plan_.remaps.capacity()*sizeof(KvMemRemap);
+        bytes += pending_gpu_frees_.capacity()*sizeof(int32_t) + prefetch_futs_.capacity()*sizeof(std::future<void>);
+        for (const auto & entry : prefetch_buf_) if (entry.second) bytes += entry.second->capacity();
+        return bytes;
+    }
     // Abandon a prepared plan instead of applying it. The staging half may
     // already have run, so the caller owns putting its own view of residency
     // back; this drops the pending marker and the GPU slots the plan had

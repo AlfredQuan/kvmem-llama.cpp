@@ -165,6 +165,15 @@ LLAMA_API void llama_kvmem_dump_kv_writeback(struct llama_context * ctx, int32_t
 #include <vector>
 #include <string>
 
+namespace kvmem { class SnapshotWriter; class SnapshotReader; }
+// Process-local disk-cache hooks. Park leaves an empty, valid execution store
+// attached so the outgoing RAM can be released before a cold store is read.
+LLAMA_API bool llama_kvmem_store_park();
+LLAMA_API void llama_kvmem_store_snapshot_write(int32_t id, kvmem::SnapshotWriter & out);
+LLAMA_API void llama_kvmem_store_snapshot_read(int32_t id, kvmem::SnapshotReader & in);
+LLAMA_API void llama_kvmem_store_release_payload(int32_t id);
+LLAMA_API uint64_t llama_kvmem_store_capacity(uint32_t tokens);
+
 struct llama_kvmem_row_range {
     int32_t begin = 0;
     int32_t end = 0;

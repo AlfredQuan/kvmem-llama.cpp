@@ -20,6 +20,7 @@
 #include "llama-model.h"
 
 #include "llama.h"
+#include "kvmem/snapshot.hpp"
 
 #include "ggml-backend.h"
 #include "ggml-backend-impl.h"
@@ -61,6 +62,7 @@ struct llama_memory_kvmem::GdnReplay {
 // a condition variable and an io thread, so both travel as unique_ptr, which is
 // how they are already held.
 struct llama_memory_kvmem::ConvStore {
+    bool cold = false;
     std::unique_ptr<kvmem::KvMemRuntime> runtime;
     std::unique_ptr<kvmem::RawKvStore>   raw;
     std::vector<RowPosition>             row_positions;
@@ -853,14 +855,45 @@ uint64_t llama_memory_kvmem::conv_host_bytes(const ConvStore & conv) const {
     if (!conv.raw) {
         return 0;
     }
-    return (uint64_t) conv.raw->bytes_k() + (uint64_t) conv.raw->bytes_v();
+    uint64_t bytes = conv.raw->allocated_bytes() + (conv.mtp_raw ? conv.mtp_raw->allocated_bytes() : 0);
+    bytes += conv.runtime->allocated_bytes() + conv.row_positions.capacity()*sizeof(RowPosition);
+    bytes += conv.q_count.capacity()*sizeof(uint32_t) + conv.resident.capacity()*sizeof(uint32_t);
+    bytes += conv.q_sum.capacity()*sizeof(std::vector<float>);
+    for (const auto & q : conv.q_sum) bytes += q.capacity()*sizeof(float);
+    return bytes;
 }
 
 uint64_t llama_memory_kvmem::host_bytes() const {
     if (!raw_) {
         return 0;
     }
-    return (uint64_t) raw_->bytes_k() + (uint64_t) raw_->bytes_v();
+    uint64_t bytes = raw_->allocated_bytes() + (mtp_ ? mtp_->host_bytes() : 0);
+    bytes += runtime_->allocated_bytes() + row_positions_.capacity()*sizeof(RowPosition);
+    bytes += q_count_.capacity()*sizeof(uint32_t);
+    bytes += q_sum_.capacity()*sizeof(std::vector<float>);
+    for (const auto & q : q_sum_) bytes += q.capacity()*sizeof(float);
+    return bytes;
+}
+
+uint64_t llama_memory_kvmem::host_capacity(uint32_t tokens) const {
+    // Bound retained checkpoints as well as raw KV. A single sequence writes
+    // one logical recurrent row, irrespective of GPU rollback plane count.
+    uint64_t checkpoint = 65536;
+    if (recr_) {
+        for (const auto * list : { &recr_->r_l, &recr_->s_l, &recr_->p_l })
+            for (const auto * t : *list) if (t) checkpoint += ggml_row_size(t->type, t->ne[0]);
+    } else {
+        // Dense memory does not implement PARTIAL_ONLY: its server checkpoint
+        // contains the attention working set and cell metadata.
+        for (const auto & buffer : kv_->memory_breakdown()) checkpoint += buffer.second;
+        checkpoint += uint64_t(kv_size_)*64;
+    }
+    checkpoint += uint64_t(n_layer_)*(n_embd_k_ + uint64_t(n_head_)*n_embd_head_)*sizeof(float);
+    // MTP carry, token/prompt indexes, query state and bounded allocator slack.
+    return 8*checkpoint + 8*1024*1024 + uint64_t(tokens)*64 +
+        raw_->capacity_bytes(tokens, uint32_t(kv_->get_layer_ids().size())) + (mtp_ ? mtp_->capacity_bytes(tokens) : 0) +
+        uint64_t(tokens)*sizeof(RowPosition)*2 +
+        ((uint64_t(tokens)/block_tokens_) + 2)*sizeof(kvmem::KvMemBlock)*2;
 }
 
 std::unique_ptr<llama_memory_kvmem::ConvStore> llama_memory_kvmem::detach_conv() {
@@ -4530,7 +4563,7 @@ bool llama_kvmem_store_switch(int32_t store_id) {
     }
     kvmem_conv_entry * in = kvmem_conv_find(store_id);
     kvmem_conv_entry * out = kvmem_conv_find(g_conv_pool.active);
-    if (!in || !out || !in->store || out->store) {
+    if (!in || !in->store || in->store->cold || (out && out->store) || (!out && g_conv_pool.active != -1)) {
         LLAMA_LOG_ERROR("%s: KVMem store %d is not a detached host store\n", __func__, store_id);
         return false;
     }
@@ -4565,10 +4598,12 @@ bool llama_kvmem_store_switch(int32_t store_id) {
         return false;
     }
     // swap_conv leaves the outgoing conversation in the handle it was given.
-    out->store = std::move(in->store);
+    const int32_t out_id = out ? out->id : -1;
+    if (out) out->store = std::move(in->store);
+    else kvmem_conv_release(in->store); // temporary empty execution store
     g_conv_pool.active = store_id;
     kvmem_diag("KVMEM_STORE_SWAP out=%d in=%d n_stores=%zu out_rows=%u in_rows=%u restaged=%d ms=%.2f\n",
-            out->id, store_id, g_conv_pool.entries.size(), out_rows, mem->store_n_tokens(),
+            out_id, store_id, g_conv_pool.entries.size(), out_rows, mem->store_n_tokens(),
             (int) restaged, (ggml_time_us() - t0) / 1000.0);
     return restaged;
 }
@@ -4627,4 +4662,64 @@ uint64_t llama_kvmem_store_bytes(int32_t store_id) {
     }
     const kvmem_conv_entry * e = kvmem_conv_find(store_id);
     return (e && e->store) ? mem->conv_host_bytes(*e->store) : 0;
+}
+
+bool llama_kvmem_store_park() {
+    auto * mem = kvmem_capture_active();
+    if (!mem || !kvmem_conv_pool_bind(mem)) return false;
+    if (g_conv_pool.active == -1) return true;
+    auto * out = kvmem_conv_find(g_conv_pool.active);
+    if (!out || out->store) return false;
+    try {
+        auto empty = mem->make_conv();
+        mem->swap_conv(empty);
+        out->store = std::move(empty);
+        g_conv_pool.active = -1;
+        return true;
+    } catch (const std::exception & e) {
+        LLAMA_LOG_ERROR("KVMEM session park failed: %s\n", e.what());
+        return false;
+    }
+}
+
+static llama_memory_kvmem::ConvStore & kvmem_detached(int32_t id) {
+    if (g_conv_pool.owner != kvmem_capture_active() || id == g_conv_pool.active)
+        throw std::runtime_error("session snapshot requires a detached store");
+    auto * e = kvmem_conv_find(id);
+    if (!e || !e->store) throw std::runtime_error("unknown detached session store");
+    return *e->store;
+}
+
+void llama_kvmem_store_snapshot_write(int32_t id, kvmem::SnapshotWriter & out) {
+    auto & s = kvmem_detached(id);
+    if (s.cold) throw std::runtime_error("session is already on disk");
+    out.scalar(id);
+    out.scalar(s.runtime->store().total_tokens());
+    s.raw->snapshot_write(out);
+    out.scalar(uint8_t(s.mtp_raw != nullptr));
+    if (s.mtp_raw) s.mtp_raw->snapshot_write(out);
+}
+
+void llama_kvmem_store_release_payload(int32_t id) {
+    auto & s = kvmem_detached(id);
+    auto raw = std::make_unique<kvmem::RawKvStore>(s.raw->config());
+    auto mtp = s.mtp_raw ? std::make_unique<kvmem::RawKvStore>(s.mtp_raw->config()) : nullptr;
+    s.raw = std::move(raw); s.mtp_raw = std::move(mtp); s.cold = true;
+}
+
+void llama_kvmem_store_snapshot_read(int32_t id, kvmem::SnapshotReader & in) {
+    auto & s = kvmem_detached(id);
+    if (!s.cold) throw std::runtime_error("session restore requires an empty host payload");
+    in.expect(id); in.expect(s.runtime->store().total_tokens());
+    auto raw = std::make_unique<kvmem::RawKvStore>(s.raw->config());
+    raw->snapshot_read(in, s.runtime->store().block_count());
+    in.expect(uint8_t(s.mtp_raw != nullptr));
+    auto mtp = s.mtp_raw ? std::make_unique<kvmem::RawKvStore>(s.mtp_raw->config()) : nullptr;
+    if (mtp) mtp->snapshot_read(in, s.runtime->store().block_count());
+    s.raw = std::move(raw); s.mtp_raw = std::move(mtp); s.cold = false;
+}
+
+uint64_t llama_kvmem_store_capacity(uint32_t tokens) {
+    auto * mem = kvmem_capture_active();
+    return mem ? mem->host_capacity(tokens) : 0;
 }

@@ -216,10 +216,14 @@ try:
     check('multi conversations armed', 'store_select' in multi['log'])
     check('multi A1 is cold', hit(a1) == 0)
     check('multi B1 does not attach to A', hit(b1) == 0)
+    # Without MTP, re-templating can put the last generation checkpoint past
+    # the usable prefix. Resuming the query-start checkpoint legitimately
+    # replays up to the 512-token query plus template slack. A percentage
+    # threshold incorrectly rejects this for ~3k prompts (2719/3240 < 90%).
     check('multi A2 hits after B was served',
-          hit(a2) >= 1024 and hit(a2) >= 0.9 * a1['usage']['prompt_tokens'])
+          hit(a2) >= max(1024, a1['usage']['prompt_tokens'] - 512 - 64))
     check('multi B2 hits after A2 was served',
-          hit(b2) >= 0.9 * b1['usage']['prompt_tokens'])
+          hit(b2) >= max(1024, b1['usage']['prompt_tokens'] - 512 - 64))
     check('multi A3 still resident', hit(a3) >= hit(a2))
     check('multi extends the two live conversations three times',
           multi['log'].count('store_select action=extend') == 3)

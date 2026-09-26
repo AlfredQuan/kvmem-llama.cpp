@@ -92,6 +92,12 @@ int main() {
     check(kvmem_server_options{}.conversations == 1);
     check(kvmem_server_options{}.conversation_bytes == 0);
     check(o.conversations == 1 && o.conversation_bytes == 0);
+    parse("--kvmem-session-ram-gb", "1.5"); check(o.conversation_bytes == 1610612736ull);
+    parse("--kvmem-session-nvme-gb", "2"); check(o.session_disk_bytes == 2147483648ull);
+    parse("--kvmem-session-cache-dir", "D:/session cache"); check(o.session_cache_dir == "D:/session cache");
+    for (const char * bad : {"nan", "inf", "-1", "2gb", "1048577"})
+        rejects([&] { parse("--kvmem-session-nvme-gb", bad); });
+    rejects([&] { parse("--kvmem-session-cache-dir", ""); });
     for (const char * value : {"1", "2", "8", "64", "2147483647"}) {
         parse("--kvmem-conversations", value);
         check(o.conversations == std::stoi(value));

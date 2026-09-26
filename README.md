@@ -44,6 +44,9 @@ Core flags (what the 16 GiB recipes still pass):
 | `--kvmem-gen-reserve` | GPU slots reserved for new tokens so retrieval cannot fill the pool. **One generation cannot exceed this length** (including thinking). |
 | `--kvmem-conversations N` | How many conversations keep their KV in host RAM. Default `1` reproduces earlier behavior, where a different conversation discards the previous one. Higher values let the server switch between conversations without reprocessing them; requests are still served one at a time. Needs flash attention. |
 | `--kvmem-conversations-gb GB` | Cap the accounted host store bytes summed over conversations, evicting the least recently used **inactive** conversation first. Default `0` means no byte cap, leaving the count above as the only bound. Requires `--kvmem-conversations N` with `N > 1`. |
+| `--kvmem-session-ram-gb GB` | Alias for the session RAM cap. With session disk caching, a request that cannot fit is rejected before inference. |
+| `--kvmem-session-nvme-gb GB` | Enable disk storage for inactive sessions with this total quota. RAM pressure spills sessions to disk; disk pressure discards them by LRU. Default `0` disables it. |
+| `--kvmem-session-cache-dir PATH` | Directory on your NVMe/SSD for the session files; required when session disk caching is enabled. |
 | `--kv-dtype` | Sets the same cache type for **main** attention K and V (IQ3 q8_0, IQ4 q5_0). Use `-ctk q8_0 -ctv q4_0` for mixed precision. |
 | `--spec-type draft-mtp` | Enable multi-token prediction. |
 | `--mmproj` | Vision projector GGUF. Omit for text-only. |
@@ -51,6 +54,8 @@ Core flags (what the 16 GiB recipes still pass):
 KVMem retrieval is on by default, with 128-token blocks, query replay `auto`, query policy `user`, MTP draft length 3, F16 draft KV, and ReplaySSM. You do not need to pass those unless you are overriding them. GPU KV size is `budget + gen_reserve`. When history exceeds `--kvmem-budget`, retrieval picks blocks for the current last-user query. Clients should send the full `messages` history each turn.
 
 With `--kvmem-conversations` above 1, that history is also the conversation's identity: no client API change and no conversation id are required. A request that continues a stored conversation extends it, while a request that only shares a system prompt or chat template starts a separate one instead of truncating the stored tail. A match is usable only when a recurrent checkpoint exists at or before it; otherwise the request is an ordinary cache miss. Details and limits are in [Multi-conversation KV cache](docs/multi-conversation-kv-cache.md).
+
+For example, add `--kvmem-conversations 3 --kvmem-session-ram-gb 12 --kvmem-session-nvme-gb 40 --kvmem-session-cache-dir D:/KVMem/session-cache` to retain sessions across RAM and disk. The active session must fit RAM. See [Session disk cache](docs/session-disk-cache.md) for accounting, recovery and testing.
 
 ## How KVMem attaches to llama.cpp
 

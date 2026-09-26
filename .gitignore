@@ -14,6 +14,7 @@ __pycache__/
 /build-ui*/
 
 /build-win*/
+/build-session*/
 /build-hip*/
 /dist/
 /artifacts/

@@ -125,6 +125,8 @@ public:
     std::unique_ptr<kvmem::RawKvStore> make_raw() const {
         return std::make_unique<kvmem::RawKvStore>(raw_cfg_);
     }
+    uint64_t host_bytes() const { return raw_ ? raw_->allocated_bytes() : 0; }
+    uint64_t capacity_bytes(uint32_t tokens) const { return raw_ ? raw_->capacity_bytes(tokens) : 0; }
     // Empty the draft cells but keep the mirror, unlike clear(bool) which also
     // wipes raw_. Called from the target's detach after its own drain, which
     // is where on_stage_out() mirrors each resident block -- every one of

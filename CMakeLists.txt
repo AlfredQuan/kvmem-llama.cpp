@@ -38,6 +38,11 @@ add_executable(kvmem-conversation-store-test tests/conversation-store-test.cpp)
 target_include_directories(kvmem-conversation-store-test PRIVATE tools)
 add_test(NAME kvmem-conversation-store-test COMMAND kvmem-conversation-store-test)
 
+add_executable(kvmem-session-snapshot-test tests/session-snapshot-test.cpp)
+target_include_directories(kvmem-session-snapshot-test PRIVATE tools)
+target_link_libraries(kvmem-session-snapshot-test PRIVATE kvmem)
+add_test(NAME kvmem-session-snapshot-test COMMAND kvmem-session-snapshot-test)
+
 option(KVMEM_BUILD_LLAMA "Build llama.cpp with the KVMem adapter" ON)
 option(KVMEM_ROCM "Build KVMem with the HIP/ROCm backend" OFF)
 if (KVMEM_ROCM)
@@ -253,6 +258,7 @@ if (KVMEM_BUILD_LLAMA)
     add_executable(llama-kvmem-server tools/llama-kvmem-server.cpp tools/kvmem-spec.cpp
         tools/kvmem-vision.cpp llama.cpp/tools/server/server-common.cpp)
     target_include_directories(llama-kvmem-server PRIVATE
+        kvmem/include
         src/adapter
         llama.cpp/include
         llama.cpp/common

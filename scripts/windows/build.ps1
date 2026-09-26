@@ -77,7 +77,8 @@ if ($HostOnly) {
         "-DCMAKE_CUDA_COMPILER=$CudaPath/bin/nvcc.exe", "-DCMAKE_CUDA_ARCHITECTURES=$CudaArchitectures")
 }
 Invoke-Checked cmake $options
-$targets = @('kvmem_store_test', 'pinned_kv_tier_test', 'nvme_disabled_test', 'kvmem_runtime_test', 'raw_kv_store_test')
+$targets = @('kvmem_store_test', 'pinned_kv_tier_test',
+    'kvmem-conversation-store-test', 'kvmem-session-snapshot-test')
 if (!$HostOnly) {
     $targets += @('llama-kvmem-server', 'llama-kvmem-cli', 'llama-quantize',
         'kvmem-chat-id-test', 'kvmem-reasoning-budget-test', 'kvmem-chat-template-test', 'kvmem-server-options-test',
@@ -86,6 +87,6 @@ if (!$HostOnly) {
 Invoke-Checked cmake (@('--build', $BuildDir, '--parallel', "$Jobs", '--target') + $targets)
 if (!$BuildOnly) {
     Invoke-Checked ctest @('--test-dir', $BuildDir, '--output-on-failure', '-R',
-        '^(kvmem_store_test|pinned_kv_tier_test|nvme_disabled_test|kvmem_runtime_test|raw_kv_store_test|kvmem-chat-id-test|kvmem-reasoning-budget-test|kvmem-chat-template-test|kvmem-server-options-test|kvmem-server-progress-test|kvmem-output-limit-test)$')
+        '^(kvmem_store_test|pinned_kv_tier_test|kvmem-conversation-store-test|kvmem-session-snapshot-test|kvmem-chat-id-test|kvmem-reasoning-budget-test|kvmem-chat-template-test|kvmem-server-options-test|kvmem-server-progress-test|kvmem-output-limit-test)$')
     Write-Host "Built and tested: $BuildDir"
 } else { Write-Host "Built only; runtime tests NOT run: $BuildDir" }

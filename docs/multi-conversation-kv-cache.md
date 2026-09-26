@@ -1,5 +1,9 @@
 # Multi-conversation KV cache
 
+For the optional RAM/NVMe extension, capacity admission and disk restore, see
+[Session disk cache](session-disk-cache.md). The policy below describes the
+original RAM-only mode unless stated otherwise.
+
 `--kvmem-conversations N` lets the server hold N conversations' KV in host RAM
 at the same time and switch between them. With the flag absent, or set to `1`,
 the server behaves exactly as before: a request that does not continue the
@@ -68,13 +72,10 @@ continuation's tail shrinks: the client dropped the last assistant turn
 `--kvmem-conversations-gb GB` caps the accounted host bytes summed over the
 live stores. It only caps stores `--kvmem-conversations N` creates, so passing
 it without `N > 1` is rejected at startup rather than silently ignored. Per
-store the number is `RawKvStore::bytes_k() + bytes_v()`
-([`kvmem/src/host/raw_kv_store.cpp`](../kvmem/src/host/raw_kv_store.cpp):1045
-and :1073) plus the server-side recurrent checkpoints and the cached token
-vector. `bytes_k()` sums, for every block and layer, the raw K rows, the packed
-GPU-format K, the F32 mean sums and the NVMe tail; `bytes_v()` does the same
-for V. So it is accounted store bytes, not pure anonymous host RAM, and it does
-not include the pinned `cpu_arena_` that `--kvmem-cpu-gb` allocates per store.
+store the number includes allocated raw main/MTP KV vectors, F32 mean sums,
+runtime arenas and metadata, server recurrent checkpoints, query state and
+cached token indexes. It describes retained session storage, not total process
+RSS or GPU allocations.
 
 Two properties to read literally:
 
