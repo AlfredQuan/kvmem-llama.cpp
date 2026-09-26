@@ -403,6 +403,7 @@ static bool run_prefill_multimodal(ServerState & st, StreamIo * io, int * n_cach
             }
             if (replay) {
                 multimodal_restore(st, query_checkpoint, false);
+                llama_kvmem_blend(st.ctx);
                 llama_kvmem_set_replay(true);
                 const int rc = multimodal_decode_span(st, query, eval_end, true, io);
                 llama_kvmem_set_replay(false);

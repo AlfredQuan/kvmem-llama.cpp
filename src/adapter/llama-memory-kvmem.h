@@ -110,6 +110,9 @@ public:
     bool selection_fits(const llama_kvmem_selection & selection, uint32_t end, uint32_t generation_rows) const;
     bool commit_unchanged(const llama_kvmem_attention_view & view, const llama_kvmem_selection & selection);
     void apply_selection(const llama_kvmem_selection & selection);
+    uint32_t blend(llama_context * ctx, float ratio, bool batch_sparse = true);
+    void blend_restore();
+    bool blend_active() const { return blend_active_; }
     bool commit_resident(bool canonical = true);
     bool get_query(llama_kvmem_query_state & state);
     bool set_query(const llama_kvmem_query_state & state);
@@ -353,6 +356,9 @@ private:
         bool spatial = false;
     };
     std::vector<RowPosition> row_positions_;
+    std::vector<uint32_t> blend_blocks_;
+    bool blend_active_ = false;
+    llama_pos blend_pos_ = -1;
 
     kvmem::RopeConfig rope_{};
     uint32_t n_layer_ = 0;

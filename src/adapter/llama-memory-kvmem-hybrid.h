@@ -29,6 +29,8 @@ public:
 
     bool seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) override;
 
+    llama_pos seq_pos_max(llama_seq_id seq_id) const override;
+
     llama_memory_kvmem * attn_kvmem() { return attn_kvmem_.get(); }
 
 private:

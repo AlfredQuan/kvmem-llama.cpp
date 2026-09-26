@@ -628,6 +628,7 @@ void llama_memory_kvmem::reset_slots() {
 }
 
 void llama_memory_kvmem::reset_policy() {
+    blend_blocks_.clear();
     ++attention_epoch_;
     explicit_spans_ = false;
     query_frozen_ = false;
@@ -662,6 +663,12 @@ void llama_memory_kvmem::begin_cached_turn(bool reset_query) {
 
 void llama_memory_kvmem::truncate_cached(uint32_t n_past) {
     if (runtime_ && n_past >= runtime_->store().total_tokens()) return;
+    for (uint32_t id : blend_blocks_) {
+        if (store().blocks()[id].orig_pos_end() > n_past) {
+            blend_restore();
+            break;
+        }
+    }
     ++attention_epoch_;
     harvest_flush();
     harvest_gpu_v_commit();
@@ -783,6 +790,7 @@ void llama_memory_kvmem::trace_plan(const char * tag, const kvmem::KvMemPlan & p
 }
 
 void llama_memory_kvmem::apply_plan_to_kv(const kvmem::KvMemPlan & plan) {
+    blend_restore();
     if (!plan.stage_in.empty() || !plan.stage_out.empty()) ++attention_epoch_;
     auto & store = runtime_->store();
     for (uint32_t id : plan.stage_out) {
@@ -917,6 +925,13 @@ llama_pos llama_memory_kvmem::model_pos(uint32_t logical) const {
 bool llama_memory_kvmem::remove_logical(llama_context * ctx, llama_pos begin, llama_pos end) {
     ++attention_epoch_;
     if (mtp_ && llama_get_memory(ctx) == mtp_) return mtp_->remove_logical(begin, end);
+    for (uint32_t id : blend_blocks_) {
+        const auto & b = store().blocks()[id];
+        if ((end < 0 || b.orig_pos_start < (uint32_t) end) && (begin < 0 || b.orig_pos_end() > (uint32_t) begin)) {
+            blend_restore();
+            break;
+        }
+    }
     // Recurrent rollback is only valid across consecutive text positions.
     if (recr_ && end < 0 && begin > 0 && (size_t) begin < row_positions_.size()) {
         const auto p = model_pos(begin);
@@ -1444,6 +1459,13 @@ void llama_memory_kvmem::clear(bool data) {
 }
 
 bool llama_memory_kvmem::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
+    for (uint32_t id : blend_blocks_) {
+        const auto & b = store().blocks()[id];
+        if ((p1 < 0 || b.orig_pos_start < (uint32_t) p1) && (p0 < 0 || b.orig_pos_end() > (uint32_t) p0)) {
+            blend_restore();
+            break;
+        }
+    }
     ++attention_epoch_;
     const bool ok = kv_->seq_rm(seq_id, p0, p1);
     if (!ok) {
@@ -1486,6 +1508,7 @@ llama_pos llama_memory_kvmem::seq_pos_min(llama_seq_id seq_id) const {
 }
 
 llama_pos llama_memory_kvmem::seq_pos_max(llama_seq_id seq_id) const {
+    if (blend_active_) return blend_pos_;
     return kv_->seq_pos_max(seq_id);
 }
 
@@ -1989,6 +2012,11 @@ bool llama_memory_kvmem::d2h_submit(ggml_backend_t be) {
 }
 
 void llama_memory_kvmem::harvest_pending(ggml_backend_sched_t sched) {
+    if (blend_active_) {
+        if (sched) ggml_backend_sched_synchronize(sched);
+        if (!pos_queue_.empty()) pos_queue_.erase(pos_queue_.begin());
+        return;
+    }
     if (want_decode_mean()) {
         decode_mean_ingest(sched);
         return;
@@ -2322,6 +2350,7 @@ void llama_memory_kvmem::harvest_gpu_v_commit() {
 }
 
 void llama_memory_kvmem::harvest_gpu_v(uint32_t block_id) {
+    if (std::find(blend_blocks_.begin(), blend_blocks_.end(), block_id) != blend_blocks_.end()) blend_restore();
     if (v_trans_ || !raw_ || !kv_) {
         return;
     }
@@ -2798,6 +2827,7 @@ void llama_memory_kvmem::write_block_to_gpu(uint32_t block_id) {
 
 void llama_memory_kvmem::copy_gpu_block_to_host(uint32_t block_id, int32_t gpu_slot,
                                                 void * host, uint64_t bytes) {
+    if (std::find(blend_blocks_.begin(), blend_blocks_.end(), block_id) != blend_blocks_.end()) blend_restore();
     if (!host || !kv_ || gpu_slot < 0 || bytes == 0) {
         return;
     }
@@ -3142,6 +3172,130 @@ bool llama_memory_kvmem::set_query(const llama_kvmem_query_state & state) {
     return true;
 }
 
+void llama_memory_kvmem::blend_restore() {
+    if (blend_blocks_.empty()) return;
+    const auto start = ggml_time_us();
+    for (uint32_t id : blend_blocks_) write_block_to_gpu(id);
+    kvmem_stagein_flush_sync(nullptr, nullptr, nullptr, nullptr);
+    kvmem_diag("KVMEM_BLEND_RESTORE blocks=%zu ms=%.3f\n", blend_blocks_.size(), (ggml_time_us() - start) / 1000.0);
+    blend_blocks_.clear();
+}
+
+uint32_t llama_memory_kvmem::blend(llama_context * ctx, float ratio, bool batch_sparse) {
+    if (!std::isfinite(ratio) || ratio < 0 || ratio > 1) throw std::invalid_argument("KVMem blend ratio must be in [0,1]");
+    if (ratio == 0 || method_ != 1 || !retrieval_pinned_) return 0;
+    const auto start = ggml_time_us();
+    const uint32_t boundary = std::max(0, explicit_spans_ ? turn_spans_.replay_begin : query_begin_);
+    if (v_trans_) throw std::runtime_error("KVMem blend requires non-transposed V (enable FlashAttention)");
+    for (const auto & row : row_positions_) {
+        if (row.token == LLAMA_TOKEN_NULL || (row.spatial && (row.pos[0] != row.pos[1] || row.pos[0] != row.pos[2]))) {
+            throw std::runtime_error("KVMem blend currently requires text-only history");
+        }
+    }
+    blend_restore();
+    std::vector<uint32_t> selected;
+    uint32_t window = 0;
+    for (const auto & b : store().blocks()) {
+        if (b.gpu_slot < 0 || b.orig_pos_end() > boundary) continue;
+        // A contiguous prefix has not lost any causal context.
+        if (b.orig_pos_start != window) selected.push_back(b.block_id);
+        window += b.n_tokens;
+    }
+    const uint32_t budget = (uint32_t) std::floor(window * (double) ratio);
+    auto score = [&](uint32_t id) {
+        const auto s = store().blocks()[id].retrieval_score;
+        return std::isfinite(s) ? s : 0.0;
+    };
+    std::sort(selected.begin(), selected.end(), [&](uint32_t a, uint32_t b) {
+        return score(a) != score(b) ? score(a) > score(b) : a < b;
+    });
+    uint32_t tokens = 0;
+    selected.erase(std::remove_if(selected.begin(), selected.end(), [&](uint32_t id) {
+        const auto n = store().blocks()[id].n_tokens;
+        if (n > budget - tokens) return true;
+        tokens += n;
+        return false;
+    }), selected.end());
+    if (selected.empty()) return 0;
+    std::sort(selected.begin(), selected.end());
+    llama_synchronize(ctx);
+    harvest_flush();
+    for (uint32_t id : selected) harvest_gpu_v(id);
+    harvest_gpu_v_commit();
+    // Packed source bytes already back the working window; do not duplicate them on GPU.
+    for (uint32_t id : selected) {
+        const auto & b = store().blocks()[id];
+        for (int il : kv_->get_layer_ids()) {
+            if (!raw_->has_k_gpu(id, il, b.n_tokens) || !raw_->has_v_gpu(id, il, b.n_tokens)) {
+                throw std::runtime_error("KVMem blend requires complete packed source KV");
+            }
+        }
+    }
+    const bool was_replay = replay_, was_frozen = query_frozen_;
+    auto restore_compute = [&]() {
+        blend_active_ = false;
+        replay_ = was_replay;
+        query_frozen_ = was_frozen;
+    };
+    // M-RoPE accepts nonconsecutive text positions: batch selected rows while
+    // retaining their original RoPE positions and the cache's causal mask.
+    batch_sparse = batch_sparse && model_.hparams.n_pos_per_embd() > 1;
+    std::vector<llama_pos> rows;
+    uint32_t runs = 0, forwards = 0;
+    for (uint32_t id : selected) {
+        const auto & b = store().blocks()[id];
+        if (rows.empty() || rows.back() + 1 != (llama_pos) b.orig_pos_start) ++runs;
+        for (uint32_t row = b.orig_pos_start; row < b.orig_pos_end(); ++row) rows.push_back(row);
+    }
+    blend_blocks_ = selected;
+    const auto prepared = ggml_time_us();
+    try {
+        // Hybrid approximation: retain and advance the live recurrent state across
+        // selected spans. Query replay continues from this state (no reset/restore).
+        blend_active_ = replay_ = query_frozen_ = true;
+        for (size_t offset = 0; offset < rows.size();) {
+            uint32_t n = 1;
+            while (offset+n < rows.size() && n < llama_n_batch(ctx) &&
+                    (batch_sparse || rows[offset+n] == rows[offset+n-1] + 1)) ++n;
+            std::vector<llama_token> input(n);
+            std::vector<llama_pos> positions(4*n);
+            std::vector<int8_t> outputs(n, 0);
+            for (uint32_t j = 0; j < n; ++j) {
+                const auto & row = row_positions_[rows[offset+j]];
+                input[j] = row.token;
+                for (uint32_t axis = 0; axis < 4; ++axis) positions[axis*n+j] = row.pos[axis];
+            }
+            auto batch = llama_batch_get_one(input.data(), n);
+            batch.pos = positions.data();
+            batch.logical_pos = rows.data() + offset;
+            batch.logits = outputs.data();
+            blend_pos_ = positions[0] - 1;
+            if (llama_decode(ctx, batch) != 0) throw std::runtime_error("KVMem blend decode failed");
+            offset += n;
+            ++forwards;
+        }
+        llama_synchronize(ctx);
+        restore_compute();
+    } catch (...) {
+        llama_synchronize(ctx);
+        restore_compute();
+        blend_restore();
+        throw;
+    }
+    const auto end = ggml_time_us();
+    kvmem_diag("KVMEM_BLEND tokens=%u window_tokens=%u blocks=%zu runs=%u forwards=%u ratio=%.6f ms=%.3f prepare_ms=%.3f forward_ms=%.3f recurrent=%s source_kv=preserved\n",
+            tokens, window, selected.size(), runs, forwards, ratio, (end - start) / 1000.0,
+            (prepared - start) / 1000.0, (end - prepared) / 1000.0,
+            recr_ ? "carry" : "none");
+    return tokens;
+}
+
+uint32_t llama_kvmem_blend(llama_context * ctx) {
+    if (g_kvmem_params.blend_ratio == 0) return 0;
+    auto * mem = kvmem_capture_active();
+    return mem ? mem->blend(ctx, g_kvmem_params.blend_ratio) : 0;
+}
+
 void llama_memory_kvmem::apply_retrieval() {
     if (method_ != 1) { harvest_flush(); return; }
     apply_selection(preview_retrieval());
@@ -3151,6 +3305,7 @@ void llama_memory_kvmem::apply_selection(const llama_kvmem_selection & selection
     if (selection.epoch != attention_epoch_ || selection.rows != store_n_tokens()) {
         throw std::runtime_error("stale KVMem selection");
     }
+    blend_restore();
     const int64_t t_all = ggml_time_us();
     kvmem::KvMemPlan plan;
     {

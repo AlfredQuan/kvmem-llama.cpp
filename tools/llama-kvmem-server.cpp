@@ -105,6 +105,7 @@ static void print_usage(const char * argv0) {
             "                            request fields override these process defaults\n"
             "  --kvmem / --no-kvmem       enable KVMem (default on)\n"
             "  --kvmem-budget N           GPU working-set tokens; 0 = n_ctx\n"
+            "  --kvmem-blend-ratio R      experimental history refresh before query replay, 0..1 (default 0)\n"
             "  --kvmem-block-tokens N     block size (default 128)\n"
             "  --kvmem-sink-tokens N      always-kept prefix; default 0 = one block; rounds down, minimum one block\n"
             "  --kvmem-gen-reserve N      decode slack (default 256)\n"
@@ -876,6 +877,7 @@ static bool run_prefill_retrieval(ServerState & st, const std::vector<llama_toke
                             llama_memory_seq_pos_min(md, 0), llama_memory_seq_pos_max(md, 0));
                 }
             }
+            llama_kvmem_blend(ctx);
             if (!replay(q0, q1, "query replay")) {
                 return false;
             }
@@ -1648,6 +1650,8 @@ int main(int argc, char ** argv) {
             st.kparams.enabled = false;
         } else if (eq(arg, "--kvmem-budget")) {
             st.kparams.budget = (uint32_t) kvmem_cli_int(arg, need(arg));
+        } else if (eq(arg, "--kvmem-blend-ratio")) {
+            st.kparams.blend_ratio = (float) kvmem_cli_real(arg, need(arg), 0, 1);
         } else if (eq(arg, "--kvmem-block-tokens")) {
             st.kparams.block_tokens = (uint32_t) kvmem_cli_int(arg, need(arg));
         } else if (eq(arg, "--kvmem-gen-reserve")) {
@@ -1911,7 +1915,7 @@ int main(int argc, char ** argv) {
         {"n_predict", st.n_predict_default},
         {"kv", {{"k", ggml_type_name(st.cache_type_k)}, {"v", ggml_type_name(st.cache_type_v)}}},
         {"kvmem", {{"enabled", st.kparams.enabled}, {"budget", st.kparams.budget}, {"gen_reserve", st.kparams.gen_reserve},
-                   {"sink_tokens", st.kparams.sink_tokens}, {"block_tokens", st.kparams.block_tokens}}},
+                   {"sink_tokens", st.kparams.sink_tokens}, {"block_tokens", st.kparams.block_tokens}, {"blend_ratio", st.kparams.blend_ratio}}},
         {"spec_type", st.spec_mtp ? "draft-mtp" : "none"},
         {"vision", {{"enabled", !mmproj_path.empty()}, {"projector", mmproj_path}, {"gpu", mmproj_gpu}}},
         {"http", {{"host", host}, {"port", port}, {"timeout", options.timeout}, {"slots", 1}}},
