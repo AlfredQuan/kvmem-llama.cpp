@@ -90,7 +90,8 @@ if ($HostOnly) {
     }
 }
 Invoke-Checked cmake $options
-$targets = @('kvmem_store_test', 'pinned_kv_tier_test')
+$targets = @('kvmem_store_test', 'pinned_kv_tier_test',
+    'kvmem-conversation-store-test', 'kvmem-session-snapshot-test')
 if (!$HostOnly) {
     $targets += @('llama-kvmem-server', 'llama-kvmem-cli', 'llama-quantize',
         'kvmem-chat-id-test', 'kvmem-reasoning-budget-test', 'kvmem-chat-template-test', 'kvmem-server-options-test',
@@ -99,6 +100,6 @@ if (!$HostOnly) {
 Invoke-Checked cmake (@('--build', $BuildDir, '--parallel', "$Jobs", '--target') + $targets)
 if (!$BuildOnly) {
     Invoke-Checked ctest @('--test-dir', $BuildDir, '--output-on-failure', '-R',
-        '^(kvmem_store_test|pinned_kv_tier_test|kvmem-chat-id-test|kvmem-reasoning-budget-test|kvmem-chat-template-test|kvmem-server-options-test|kvmem-server-progress-test|kvmem-output-limit-test|kvmem-responses-test)$')
+        '^(kvmem_store_test|pinned_kv_tier_test|kvmem-conversation-store-test|kvmem-session-snapshot-test|kvmem-chat-id-test|kvmem-reasoning-budget-test|kvmem-chat-template-test|kvmem-server-options-test|kvmem-server-progress-test|kvmem-output-limit-test|kvmem-responses-test)$')
     Write-Host "Built and tested: $BuildDir"
 } else { Write-Host "Built only; runtime tests NOT run: $BuildDir" }

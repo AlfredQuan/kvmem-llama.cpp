@@ -15,6 +15,7 @@ __pycache__/
 /build-ui*/
 
 /build-win*/
+/build-session*/
 
 # Local one-click launchers pinned to this machine's paths
 /start-local.*

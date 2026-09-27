@@ -29,6 +29,9 @@ public:
     std::vector<std::pair<uint32_t, std::string>> media_identity() const;
     std::shared_ptr<kvmem_prompt> with_generated(const std::vector<llama_token> & gen) const;
     std::shared_ptr<kvmem_prompt> prefix(size_t rows) const;
+    // Matching/position metadata without the original image/audio tensors.
+    std::shared_ptr<kvmem_prompt> cache_index() const;
+    size_t index_bytes() const;
 private:
     std::shared_ptr<server_tokens> native_;
     std::map<size_t, llama_pos> position_offsets_ {{0, 0}};

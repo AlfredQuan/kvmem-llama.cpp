@@ -8,7 +8,7 @@
 
 llama.cpp inference with tiered KV memory for long-running agents.
 
-**KVMem** adds a bounded GPU KV working set, host-memory storage and query-based retrieval to [llama.cpp](https://github.com/ggml-org/llama.cpp). llama.cpp handles model loading, inference, quantization and MTP. The separate `llama-kvmem-server` provides OpenAI-compatible chat, tools and optional vision. **NVMe offload is not implemented.**
+**KVMem** adds a bounded GPU KV working set, host-memory storage and query-based retrieval to [llama.cpp](https://github.com/ggml-org/llama.cpp). llama.cpp handles model loading, inference, quantization and MTP. The separate `llama-kvmem-server` provides OpenAI-compatible chat, tools and optional vision. This branch also supports opt-in NVMe snapshots for inactive sessions; the rc3 prebuilts listed below predate that feature.
 
 This port supports **Qwen3.8-27B GGUF quants**, including IQ3 and IQ4. The sibling [kvmem-qw3](https://github.com/kvmem/kvmem-qw3) is a CUDA-native runtime focused on Q8, primarily tested on RTX PRO 6000.
 
@@ -42,11 +42,20 @@ Core flags (what the 16 GiB recipes still pass):
 | `--kvmem-budget` | How many historical tokens retrieval may keep on GPU. |
 | `--kvmem-sink-tokens N` | Server and CLI: always keep the prefix in the GPU working set. Default `0` keeps one block (not disabled). Positive values round down to whole blocks, with a minimum of one block. For example, with block size 128, `1024` keeps 1024 tokens and `129` keeps 128. These blocks count toward `--kvmem-budget`. |
 | `--kvmem-gen-reserve` | GPU slots reserved for new tokens so retrieval cannot fill the pool. **One generation cannot exceed this length** (including thinking). |
+| `--kvmem-conversations N` | How many conversations retain their KV in host RAM or the optional session disk cache. Default `1` reproduces earlier behavior, where a different conversation discards the previous one. Higher values let the server switch between conversations without reprocessing them; requests are still served one at a time. Needs flash attention. |
+| `--kvmem-conversations-gb GB` | Soft cap on accounted RAM summed over active and inactive sessions. Move inactive sessions to NVMe by LRU when enabled, or evict them when RAM-only; an oversized active session continues with a warning. Default `0` means no byte cap. Requires `--kvmem-conversations N` with `N > 1`. |
+| `--kvmem-session-ram-gb GB` | Alias for the total active + inactive session RAM **soft** cap. Active KV may exceed it; idle KV moves to NVMe by LRU when enabled. `0` remains unlimited. |
+| `--kvmem-session-nvme-gb GB` | Enable disk storage for inactive sessions with this total quota. RAM pressure spills sessions to disk; disk pressure discards them by LRU. Default `0` disables it. |
+| `--kvmem-session-cache-dir PATH` | Directory on your NVMe/SSD for the session files; required when session disk caching is enabled. |
 | `--kv-dtype` | Sets the same cache type for **main** attention K and V (IQ3 q8_0, IQ4 q5_0). Use `-ctk q8_0 -ctv q4_0` for mixed precision. |
 | `--spec-type draft-mtp` | Enable multi-token prediction. |
 | `--mmproj` | Vision projector GGUF. Omit for text-only. |
 
 KVMem retrieval is on by default, with 128-token blocks, query replay `auto`, query policy `user`, MTP draft length 3, F16 draft KV, and ReplaySSM. You do not need to pass those unless you are overriding them. GPU KV size is `budget + gen_reserve`. When history exceeds `--kvmem-budget`, retrieval picks blocks for the current last-user query. Clients should send the full `messages` history each turn.
+
+With `--kvmem-conversations` above 1, that history is also the conversation's identity: no client API change and no conversation id are required. A request that continues a stored conversation extends it, while a request that only shares a system prompt or chat template starts a separate one instead of truncating the stored tail. A match is usable only when a recurrent checkpoint exists at or before it; otherwise the request is an ordinary cache miss. Details and limits are in [Multi-conversation KV cache](docs/multi-conversation-kv-cache.md).
+
+For example, add `--kvmem-conversations 3 --kvmem-session-ram-gb 12 --kvmem-session-nvme-gb 40 --kvmem-session-cache-dir D:/KVMem/session-cache` to retain sessions across RAM and disk. The active session must fit the machine's actual RAM. See [Session disk cache](docs/session-disk-cache.md) for accounting and recovery, the [1:10 multi-session stability test](docs/session-exchange-stability.md) for the large exchange check, and the [three-session 5 GiB K8/V4 test](docs/three-session-5g-k8v4-stability.md) for a real-model 10 GiB NVMe and cold-prefill comparison.
 
 ## How KVMem attaches to llama.cpp
 
@@ -93,7 +102,7 @@ Building uses a C++17 compiler, CMake and **CUDA Toolkit 13.2 Update 2 (nvcc 13.
 
 Check `nvcc --version` for the compiler selected by CMake; `release 13.2` alone is insufficient, and the CUDA version shown by `nvidia-smi` describes driver support. After upgrading the Toolkit, configure a **new build directory** and rebuild the binaries. Updating the driver or replacing CUDA DLLs does not fix CUDA kernels already compiled into an old binary.
 
-An experimental [native Windows build](scripts/windows/README.md) is being validated. It disables NVMe storage and includes PowerShell launchers; the performance results below remain Linux/WSL2 measurements.
+An experimental [native Windows build](scripts/windows/README.md) is being validated. It disables the legacy raw-block NVMe tier and includes PowerShell launchers; the session snapshot cache described above is independent of that build option. The performance results below remain Linux/WSL2 measurements.
 
 ```bash
 git clone --recurse-submodules https://github.com/kvmem/kvmem-llama.cpp.git
@@ -203,10 +212,13 @@ key and return HTTP 401 otherwise. Health checks, CORS preflights and mounted UI
 assets remain public. Loading the UI does not grant access to authenticated APIs;
 clients must supply the key. Without key flags, authentication remains disabled.
 
-Regression checks: `kvmem-server-options-test` via CTest, and
+Regression checks: `kvmem-server-options-test` and
+`kvmem-conversation-store-test` via CTest, and
 `python scripts/test_server_compat.py --server /path/to/llama-kvmem-server`.
 Add `--model PATH` for live auth/inference checks, `--mtp` for MTP, and
 `--mmproj PATH --image PATH` for the optional vision fixture containing `6037`.
+Interleaved conversations need a model of their own:
+`python scripts/test_server_conversations.py --server PATH --model PATH --output DIR`.
 
 ### Environment variables and startup diagnostics
 
@@ -504,6 +516,7 @@ Native TLS is not supported. Stream `usage` includes
 - [Recommended 16 GiB performance](docs/recommended-config-performance.md)
 - [256K tool benchmark](docs/long-context-benchmark-2026-09-14.md)
 - [Query replay](docs/query-replay-implementation-report-2026-09-14.md)
+- [Multi-conversation KV cache](docs/multi-conversation-kv-cache.md)
 - [Multimodal usage](docs/multimodal-implementation-report-2026-09-14.md)
 - Native Qwen engine: [kvmem/kvmem-qw3](https://github.com/kvmem/kvmem-qw3)
 

@@ -72,6 +72,34 @@ std::shared_ptr<kvmem_prompt> kvmem_prompt::prefix(size_t rows) const {
     return std::make_shared<kvmem_prompt>(std::move(native));
 }
 
+std::shared_ptr<kvmem_prompt> kvmem_prompt::cache_index() const {
+    auto native = std::make_shared<server_tokens>();
+    native->has_mtmd = true;
+    for (size_t row = 0; row < tokens.size();) {
+        if (tokens[row] == LLAMA_TOKEN_NULL) {
+            native->push_back_placeholder(chunk(row));
+            row = media_end(row);
+        } else {
+            native->push_back(tokens[row++]);
+        }
+    }
+    return std::make_shared<kvmem_prompt>(std::move(native));
+}
+
+size_t kvmem_prompt::index_bytes() const {
+    // The private native token vector can retain growth capacity; bound it by
+    // twice its length. Media entries here are placeholders in disk-cache mode.
+    size_t bytes = sizeof(*this) + sizeof(server_tokens) + tokens.capacity()*sizeof(llama_token) +
+        tokens.size()*sizeof(llama_token)*2 + position_offsets_.size()*64;
+    for (const auto & range : media_ranges()) {
+        size_t size = 0;
+        if (mtmd_input_chunk_save(chunk(range.first), nullptr, 0, &size))
+            throw std::runtime_error("cannot measure session media index");
+        bytes += size + 256;
+    }
+    return bytes;
+}
+
 std::string kvmem_parse_media_messages(const std::string & body, bool allow_images,
                                       std::vector<std::vector<uint8_t>> & files) {
     auto parsed = common_json::parse(body);

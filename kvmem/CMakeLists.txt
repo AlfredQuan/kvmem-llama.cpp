@@ -12,6 +12,7 @@ add_library(kvmem
     src/host/kvmem_store.cpp
     src/host/kvmem_runtime.cpp
     src/host/raw_kv_store.cpp
+    src/host/session_memory.cpp
     src/host/rope.cpp
 )
 set_target_properties(kvmem PROPERTIES POSITION_INDEPENDENT_CODE ON)
