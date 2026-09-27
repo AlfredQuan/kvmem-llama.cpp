@@ -186,6 +186,43 @@ outside the specialized 27B replay kernel (for example the local 0.8B model).
 The script starts only its own server processes on unused ports and downloads
 no models. On Windows it also locks a middle snapshot chunk to force a real
 HTTP 503, resumes the old session, and retries the target with cache hits intact.
+For an explicit multi-GPU configuration, pass `--gpu-layers all` and supply
+the server's device/split settings through `LLAMA_ARG_DEVICE`,
+`LLAMA_ARG_SPLIT_MODE`, and `LLAMA_ARG_TENSOR_SPLIT`.
+It also checks count-based LRU with four histories under a three-session cap,
+and reconciles the charged disk bytes with actual snapshot file lengths after
+each successful request.
+
+For HTTP-level concurrency, Chat/Responses streaming, optional-ID fallback,
+cancelled generation, and actual server crash/restart with another live server
+sharing the cache root:
+
+```text
+python scripts/test_server_session_lifecycle.py --server PATH/llama-kvmem-server --model PATH/small-model.gguf --gpu GPU-UUID --mtp --output artifacts/session-lifecycle
+```
+
+This fixture runs two copies of the supplied model concurrently during its
+shared-root phase; use a small model that fits twice on the selected GPU.
+Run with and without `--mtp` to cover both generation paths. The default eight
+rounds submit A/B/C simultaneously over HTTP, while the server continues to
+serialize inference through its one active slot.
+
+Image sessions have a separate real-model check. It switches between red, blue
+and green images, restores their KV from disk, then changes only the image in
+an otherwise identical prompt with the same client ID. The changed image must
+miss the old cache and answer yellow; the original red history must remain
+reusable. This fixture uses mixed K8/V4 KV and MTP snapshots:
+
+```text
+python scripts/test_server_session_multimodal.py --server PATH/llama-kvmem-server --model PATH/model.gguf --mmproj PATH/mmproj.gguf --gpu GPU-UUID --output artifacts/session-images
+```
+
+### Full validation (Windows, 2026-09-27 to 2026-09-28)
+
+See [the multi-session validation report](multi-session-validation-2026-09-27.md)
+for the 5050 / 5060 Ti matrix, shared-root crash recovery, image sessions,
+three approximately 5 GiB sessions under a 10 GiB NVMe quota, and matched
+restore-versus-prefill timings.
 
 ### Local verification (Windows, 2026-09-26)
 
