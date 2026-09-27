@@ -2,6 +2,7 @@
 #include "kvmem/raw_kv_store.hpp"
 #include <iostream>
 #include <cstring>
+#include <chrono>
 
 static void check(bool ok, const char * message) { if (!ok) throw std::runtime_error(message); }
 template<class F> static void rejects(F f) {
@@ -109,22 +110,34 @@ static void routes() {
 static void scale_1to10() {
     constexpr uint64_t unit = (uint64_t(1) << 30) / 10;
     fixture f(unit, 15, 20);
+    std::vector<double> forward_ms, reverse_ms;
     for (int cycle = 0; cycle < 2; ++cycle) {
         const auto forward = f.plan();
         check(forward.route == kvmem_session_plan::path::exchange, "1:10 forward did not exchange chunks");
-        f.execute(forward); f.verify();
+        auto started = std::chrono::steady_clock::now();
+        f.execute(forward);
+        forward_ms.push_back(std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - started).count());
+        f.verify();
         check(f.b.payload->complete() && f.a.payload->ram_bytes() == 0, "1:10 forward residency");
         check(f.files->session_bytes(1) == f.a.payload->disk_bytes() && !f.files->contains(2),
               "1:10 forward disk ownership");
         const auto reverse = f.plan(true);
         check(reverse.route == kvmem_session_plan::path::exchange, "1:10 reverse did not exchange chunks");
-        f.execute(reverse); f.verify();
+        started = std::chrono::steady_clock::now();
+        f.execute(reverse);
+        reverse_ms.push_back(std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - started).count());
+        f.verify();
         check(f.a.payload->complete() && f.b.payload->ram_bytes() == 0, "1:10 reverse residency");
     }
     check(f.peak_ram <= 15*unit && f.peak_disk <= 20*unit, "1:10 transient capacity exceeded");
     std::cout << "1:10 exchange passed: A=" << 10*unit << " B=" << 15*unit
               << " disk_quota=" << 20*unit << " peak_ram=" << f.peak_ram
               << " peak_disk=" << f.peak_disk << " bytes\n";
+    for (size_t i = 0; i < forward_ms.size(); ++i)
+        std::cout << "cycle=" << i << " A_to_B_ms=" << forward_ms[i]
+                  << " B_to_A_ms=" << reverse_ms[i] << "\n";
 }
 
 static void failure_matrix() {
