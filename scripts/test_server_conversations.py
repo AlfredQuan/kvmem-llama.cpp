@@ -1,8 +1,9 @@
 """Interleaved multi-conversation KV regression. Uses a supplied model, never downloads one.
 
-Three server launches against the same model:
+Server launches against the same model include:
   baseline   no new flag, asserting today's behavior (a returning conversation misses)
   multi      --kvmem-conversations 4, asserting hits survive an interleave and needles stay isolated
+  three_ram  --kvmem-conversations 3, asserting three sessions stay in RAM without NVMe
   eviction   --kvmem-conversations 2, asserting LRU eviction bounds the store count
 
 Needle isolation is the load-bearing assertion: attaching to the wrong host
@@ -25,6 +26,11 @@ p.add_argument('--server', required=True)
 p.add_argument('--model', required=True)
 p.add_argument('--output', required=True)
 p.add_argument('--mtp', action='store_true')
+p.add_argument('--gpu', help='CUDA GPU UUID or index to expose to the test servers')
+p.add_argument('--kv-key-dtype', default='q8_0')
+p.add_argument('--kv-value-dtype', default='q8_0')
+p.add_argument('--kvmem-budget', type=int, default=4096)
+p.add_argument('--kvmem-gen-reserve', type=int, default=2048)
 p.add_argument('--bytes-case', action='store_true',
                help='also run the byte-cap case, whose eviction point depends on model geometry')
 a = p.parse_args()
@@ -32,6 +38,9 @@ out = Path(a.output).resolve()
 out.mkdir(parents=True, exist_ok=True)
 env = os.environ.copy()
 env['KVMEM_TRACE'] = '1'  # the trace assertions below read the server log
+if a.gpu:
+    env['CUDA_VISIBLE_DEVICES'] = a.gpu
+    env['CUDA_DEVICE_ORDER'] = 'PCI_BUS_ID'
 checks = []
 headers = {'Authorization': 'Bearer api-test-only', 'Content-Type': 'application/json'}
 
@@ -96,8 +105,10 @@ def run_case(label, extra_args, script, probe=None):
     base = f'http://127.0.0.1:{port}'
     args = [a.server, '-m', a.model, '--host', '127.0.0.1', '--port', str(port),
             '-c', '16384', '-n', '128', '--api-key', 'api-test-only', '--threads-http', '4',
-            '--reasoning-effort', 'none', '--temp', '0', '--no-webui', '--kv-dtype', 'q8_0',
-            '-fa', 'on', '--kvmem-budget', '4096', '--kvmem-gen-reserve', '2048']
+            '--reasoning-effort', 'none', '--temp', '0', '--no-webui',
+            '-ctk', a.kv_key_dtype, '-ctv', a.kv_value_dtype,
+            '-fa', 'on', '--kvmem-budget', str(a.kvmem_budget),
+            '--kvmem-gen-reserve', str(a.kvmem_gen_reserve)]
     args += ['--spec-type', 'draft-mtp' if a.mtp else 'none']
     args += extra_args
     log_path = out / f'{label}-server.log'
@@ -246,6 +257,24 @@ try:
           'reason=switch_failed' not in multi['log'])
     accounting(multi, 'multi')
     answers(multi, 'multi')
+
+    # With precisely three conversations and no disk flags, all three must
+    # survive an A/B/C interleave in RAM. This mirrors the NVMe stress test's
+    # session count without allocating its 15 GiB of KV.
+    three_ram = run_case('three_ram', ['--kvmem-conversations', '3'],
+                         ['A', 'B', 'C', 'A', 'B', 'C'])
+    check('three RAM-only sessions remain cached',
+          three_ram['slot']['kvmem']['conversations']['count'] == 3)
+    check('three RAM-only sessions use no disk',
+          three_ram['slot']['kvmem']['conversations']['disk_bytes'] == 0 and
+          three_ram['slot']['kvmem']['conversations']['disk_bytes_max'] == 0 and
+          'session disk cache=' not in three_ram['log'])
+    check('three RAM-only first visits miss',
+          all(hit(turn) == 0 for turn in three_ram['turns'][:3]))
+    check('three RAM-only second visits hit',
+          all(hit(turn) > 1024 for turn in three_ram['turns'][3:]))
+    accounting(three_ram, 'three_ram')
+    answers(three_ram, 'three_ram')
 
     # Case 3: eviction. A third conversation cannot fit under a cap of two, so
     # the least recently used store goes; the survivor still hits and the

@@ -60,6 +60,8 @@ POSIX NVMe tier or `KVMEM_ENABLE_NVME`.
 
 Without `--kvmem-session-nvme-gb`, the existing RAM-only PR #45 policy remains:
 the original RAM cap is a soft retention cap and allows a larger active store.
+The [NVMe-disabled IQ3 K8/V4 regression](session-nvme-off-regression.md) checks
+the default single-session path and three RAM-only sessions on RTX 5060 Ti.
 
 ## Save and restore
 
