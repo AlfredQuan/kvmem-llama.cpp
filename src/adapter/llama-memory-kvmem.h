@@ -74,6 +74,7 @@ public:
     uint32_t kv_size() const { return kv_size_; }
     uint32_t block_tokens() const { return block_tokens_; }
     uint32_t n_slots() const { return n_slots_; }
+    bool multi_gpu() const { return multi_gpu_; }
 
     // Slot-pool prepare used by both the dense KVMem memory and the hybrid
     // wrapper (attn half). Fills per-ubatch slot_info and the capture pos queue.
@@ -291,7 +292,7 @@ private:
     void score_retrieval();
     bool read_gpu_block(uint32_t block_id, uint32_t il, bool is_k, std::vector<float> & out) const;
     static void kv_stats(const char * tag, const float * a, const float * b, size_t n);
-    static void tensor_to_f32_token_major(const struct ggml_tensor * t, std::vector<float> & out);
+    static void tensor_to_f32_token_major(const struct ggml_tensor * t, std::vector<float> & out, int64_t * read_us = nullptr);
     static void bytes_to_f32_token_major(const uint8_t * data, ggml_type type,
                                          int64_t d, int64_t h, int64_t n,
                                          size_t nb0, size_t nb1, size_t nb2,
@@ -305,6 +306,8 @@ private:
                            size_t nb0, size_t nb1, size_t nb2);
     bool d2h_init();
     void d2h_free();
+    bool multi_d2h_submit();
+    void multi_d2h_free();
     void d2h_commit(int slot);
     bool d2h_submit(struct ggml_backend * be);
     bool harvest_perf_on() const { return perf_.enabled; }
@@ -345,6 +348,8 @@ private:
         uint64_t last_nvme_syscalls = 0;
         uint32_t n_pressure = 0;
         uint32_t n_pressure_out = 0;
+        int64_t multi_read_us = 0;
+        int64_t multi_host_us = 0;
     };
 
     struct RetrPerf {
@@ -378,6 +383,7 @@ private:
     uint32_t block_tokens_ = 128;
     uint32_t kv_size_ = 0;
     uint32_t n_slots_ = 0;
+    bool multi_gpu_ = false;
     bool trace_ = false;
 
     std::unique_ptr<llama_kv_cache> kv_owned_;
@@ -464,6 +470,8 @@ private:
     bool graph_has_record_ = false;
     struct CaptureD2hPipe;
     std::unique_ptr<CaptureD2hPipe> d2h_;
+    struct MultiD2hPipe;
+    std::unique_ptr<MultiD2hPipe> multi_d2h_;
     struct HarvestWorker {
         std::mutex mu;
         std::condition_variable cv;

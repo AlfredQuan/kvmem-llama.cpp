@@ -156,20 +156,30 @@ yet accept every `llama-server` option.
 | `-np`, `--parallel` | Only `1` is supported. Automatic or multiple slots produce an error. |
 | `-to`, `--timeout` | HTTP read/write timeout in seconds; KVMem retains its 1800-second default. |
 | `--threads-http` | HTTP worker count; <= 0 selects automatically. This does not enable parallel inference slots. |
-| `-dev`, `--device`; `--list-devices` | Select one offload device (for example `CUDA0`), or `none` for CPU; list devices without loading a model. |
-| `-mg`, `--main-gpu`; `-sm`, `--split-mode` | Select a single GPU using `--split-mode none --main-gpu INDEX`. `layer` is accepted only when offloading to at most one device. |
-| `-ts`, `--tensor-split` | A single proportion is accepted; multi-device proportions are rejected. |
+| `-dev`, `--device`; `--list-devices` | Select one device or an explicit CUDA list such as `CUDA0,CUDA1`; `none` selects CPU. List devices without loading a model. |
+| `-mg`, `--main-gpu`; `-sm`, `--split-mode` | Multi-GPU requires `layer` and `--gpu-layers all`. `none` remains available for one GPU. |
+| `-ts`, `--tensor-split` | Layer proportions, with one value for each explicitly selected GPU. |
 
 Additional upstream aliases: `--usage` = `--help`, `--predict` = `--n-predict`,
 `-s` = `--seed`, `-mm` = `--mmproj`, `--no-webui` = `--no-ui`, and
 `--path` = `--ui-dir`.
 
-**Multi-GPU operation is not supported yet**, including with `--no-kvmem`.
-Multiple `--device` names, multiple `--tensor-split` entries, and `row`/`tensor`
-split modes fail before model loading. When automatic discovery sees multiple
-GPUs, select one with `--device CUDA0`, use `--split-mode none --main-gpu INDEX`,
-or expose one GPU through `CUDA_VISIBLE_DEVICES`. Indices refer to the visible
-device list (and to the selected device list when `--device` is supplied).
+The experimental layer path on this branch is opt-in. For example:
+
+```powershell
+.\llama-kvmem-server.exe --model C:\models\model.gguf --device CUDA0,CUDA1 --split-mode layer --tensor-split 2,1 --gpu-layers all --spec-type none --kvmem-budget 32768
+```
+
+Use `--list-devices` to obtain device names; the example budget must fit every
+owning GPU. A multi-GPU request requires CUDA devices, full layer offload and
+`--split-mode layer`. KVMem capture and KV layout use a synchronous backend
+path for correctness. On two GPUs, embedded `nextn` MTP is experimental and
+requires `--spec-type draft-mtp` plus an explicit
+`--kvmem-mtp-state snapshots` or `replay`; `auto` and independent draft models
+are not supported for multi-GPU MTP. Tensor and row split remain unsupported.
+Automatic discovery still requires an explicit choice when several GPUs are
+present. Indices refer to the visible device list (and to the selected list
+when `--device` is supplied). Single-GPU defaults remain unchanged.
 
 Threads, physical batch size and Flash Attention settings propagate to MTP.
 Existing model, host/port, context, sampling, chat-template, vision and KV-cache
@@ -225,7 +235,7 @@ A CLI key does not revoke an environment key.
 | `LLAMA_ARG_MODEL`, `LLAMA_ARG_ALIAS` | Model path and API model name |
 | `LLAMA_ARG_HOST`, `LLAMA_ARG_PORT`, `LLAMA_ARG_TIMEOUT`, `LLAMA_ARG_THREADS_HTTP` | HTTP server |
 | `LLAMA_ARG_CTX_SIZE`, `LLAMA_ARG_N_PREDICT`, `LLAMA_ARG_BATCH`, `LLAMA_ARG_UBATCH`, `LLAMA_ARG_THREADS` | Context, output and CPU/batch configuration |
-| `LLAMA_ARG_DEVICE`, `LLAMA_ARG_N_GPU_LAYERS`, `LLAMA_ARG_MAIN_GPU`, `LLAMA_ARG_SPLIT_MODE`, `LLAMA_ARG_TENSOR_SPLIT` | GPU selection; the same single-GPU restrictions apply |
+| `LLAMA_ARG_DEVICE`, `LLAMA_ARG_N_GPU_LAYERS`, `LLAMA_ARG_MAIN_GPU`, `LLAMA_ARG_SPLIT_MODE`, `LLAMA_ARG_TENSOR_SPLIT` | GPU selection; the same layer-only multi-GPU restrictions apply |
 | `LLAMA_ARG_FLASH_ATTN`, `LLAMA_ARG_CACHE_TYPE_K`, `LLAMA_ARG_CACHE_TYPE_V`, `LLAMA_ARG_N_PARALLEL` | Attention, KV types and single-slot configuration |
 | `LLAMA_ARG_LOAD_MODE`, `LLAMA_ARG_MMAP`, `LLAMA_ARG_MLOCK` | Model loading; legacy environment options apply before `LOAD_MODE` |
 | `LLAMA_ARG_MMPROJ`, `LLAMA_ARG_MMPROJ_OFFLOAD`, `LLAMA_ARG_IMAGE_MIN_TOKENS`, `LLAMA_ARG_IMAGE_MAX_TOKENS` | Vision |
@@ -481,6 +491,7 @@ progress-reporting approach from [PR #9](https://github.com/kvmem/kvmem-llama.cp
 - `GET /health`
 - `GET /v1/models`
 - `POST /v1/chat/completions` (sampling, stream, tools, optional images)
+- `POST /v1/responses` and `POST /responses` (OpenAI Responses, non-streaming and SSE streaming). With `--mmproj`, `input_image.image_url` accepts image URLs or Base64 data URLs through the same vision pipeline as Chat Completions. File IDs are not supported. The per-request `detail` value is ignored; image resolution is controlled by the server's image token settings. `scripts/test_responses_sdk.py` exercises both paths through the official OpenAI Python SDK, whose Responses stream parser is stricter than a hand-rolled client.
 
 No auth or TLS unless an API key is set. Binds `127.0.0.1` by default. To serve
 on the LAN, pass `--host 0.0.0.0` to the server or to the launchers

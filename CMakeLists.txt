@@ -69,8 +69,8 @@ else()
 endif()
 
 if (KVMEM_BUILD_LLAMA)
-    if (GGML_VULKAN)
-        message(FATAL_ERROR "This HIP integration does not include the Vulkan adapter. Use the Vulkan worktree; do not combine its backend with CUDA/HIP staging.")
+    if (GGML_VULKAN AND KVMEM_GPU_BACKEND STREQUAL "HIP")
+        message(FATAL_ERROR "The HIP/ROCm adapter does not support a combined Vulkan build.")
     endif()
     if (KVMEM_GPU_BACKEND STREQUAL "CUDA")
         # Let CMake discover nvcc (or honor CUDACXX/CMAKE_CUDA_COMPILER) and
@@ -261,7 +261,9 @@ if (KVMEM_BUILD_LLAMA)
     target_compile_features(llama-kvmem-cli PRIVATE cxx_std_17)
 
     add_executable(llama-kvmem-server tools/llama-kvmem-server.cpp tools/kvmem-spec.cpp
-        tools/kvmem-vision.cpp llama.cpp/tools/server/server-common.cpp)
+        tools/kvmem-vision.cpp tools/kvmem-responses.cpp tools/kvmem-responses-stream.cpp
+        llama.cpp/tools/server/server-common.cpp
+        llama.cpp/tools/server/server-chat.cpp)
     target_include_directories(llama-kvmem-server PRIVATE
         kvmem/include
         src/adapter
@@ -340,4 +342,14 @@ if (KVMEM_BUILD_LLAMA)
     target_include_directories(kvmem-output-limit-test PRIVATE tools llama.cpp/vendor/cpp-httplib)
     target_link_libraries(kvmem-output-limit-test PRIVATE llama-common cpp-httplib)
     add_test(NAME kvmem-output-limit-test COMMAND kvmem-output-limit-test)
+
+    add_executable(kvmem-responses-test tests/responses-test.cpp tests/responses-media-test.cpp
+        tools/kvmem-responses.cpp tools/kvmem-responses-stream.cpp
+        llama.cpp/tools/server/server-chat.cpp llama.cpp/tools/server/server-common.cpp)
+    target_include_directories(kvmem-responses-test PRIVATE
+        tools llama.cpp/common llama.cpp/include llama.cpp/ggml/include
+        llama.cpp/tools/server llama.cpp/tools/mtmd llama.cpp/vendor
+        llama.cpp/vendor/cpp-httplib)
+    target_link_libraries(kvmem-responses-test PRIVATE llama-common mtmd cpp-httplib nlohmann)
+    add_test(NAME kvmem-responses-test COMMAND kvmem-responses-test)
 endif()
