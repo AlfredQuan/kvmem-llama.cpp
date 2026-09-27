@@ -12,17 +12,17 @@ if [[ -z "${rocm}" ]]; then
 fi
 
 rocm_bin="${rocm}/bin"
+if [[ -n "${ROCM_CLANG_BIN:-}" && -x "${ROCM_CLANG_BIN}/clang++" ]]; then
+    rocm_bin="${ROCM_CLANG_BIN}"
+fi
 if [[ ! -x "${rocm_bin}/clang++" ]]; then
     rocm_bin="${rocm}/llvm/bin"
 fi
 if [[ ! -x "${rocm_bin}/clang++" ]]; then
     rocm_bin="${rocm}/lib/llvm/bin"
 fi
-if [[ ! -x "${rocm_bin}/clang++" && -n "${ROCM_CLANG_BIN:-}" ]]; then
-    rocm_bin="${ROCM_CLANG_BIN}"
-fi
 if [[ ! -x "${rocm_bin}/clang++" ]]; then
-    for candidate in /usr/lib/llvm-*/bin; do
+    for candidate in "${rocm}"/lib/llvm-*/bin; do
         if [[ -x "${candidate}/clang++" ]]; then
             rocm_bin="${candidate}"
             break
