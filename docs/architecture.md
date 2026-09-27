@@ -70,8 +70,8 @@ reserve partition is full. Unpinning or recency-evicting selected
 blocks would drop the query’s retrieved facts. Growing `budget +
 gen_reserve` on 16 GiB is also out: recipes already sit near 15.5 GiB.
 Streaming the whole generation through VRAM would bring back the
-adaptive-KV-streaming cost curve. NVMe is not implemented in this port;
-host RAM is enough for spilled gen KV.
+adaptive-KV-streaming cost curve. The optional NVMe session cache stores idle
+sessions, while generation spill remains in host RAM.
 
 ### Follow-up: ring buffer **inside** `gen_reserve`
 
