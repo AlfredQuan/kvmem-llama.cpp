@@ -98,6 +98,21 @@ class BuildPlanTests(unittest.TestCase):
         self.assertNotIn('GPU_TARGETS', env)
         self.assertNotIn('AMDGPU_TARGETS', env)
 
+    def test_distro_llvm_tree_accepted(self):
+        # Ubuntu-style layout: ROCm runtime under root, clang in lib/llvm-N/bin.
+        sdk = Path(self.directory.name) / 'usr'
+        (sdk / 'lib/llvm-21/bin').mkdir(parents=True)
+        (sdk / 'lib/llvm-21/bin/clang++').touch()
+        self.assertEqual(build.compiler_directory(sdk, 'linux', {}),
+                         sdk / 'lib/llvm-21/bin')
+
+    def test_rocm_clang_bin_override_wins(self):
+        custom = Path(self.directory.name) / 'custom-llvm/bin'
+        custom.mkdir(parents=True)
+        (custom / 'clang++').touch()
+        found = build.compiler_directory(self.sdk, 'linux', {'ROCM_CLANG_BIN': str(custom)})
+        self.assertEqual(found, custom)
+
 
 if __name__ == '__main__':
     unittest.main()
