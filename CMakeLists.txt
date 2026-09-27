@@ -48,6 +48,19 @@ target_include_directories(kvmem-session-transfer-test PRIVATE tools)
 target_link_libraries(kvmem-session-transfer-test PRIVATE kvmem)
 add_test(NAME kvmem-session-transfer-test COMMAND kvmem-session-transfer-test)
 
+# Independent processes exercise actual OS lock release on forced termination.
+add_executable(kvmem-session-cache-lifecycle-worker tests/session-cache-lifecycle-worker.cpp)
+target_include_directories(kvmem-session-cache-lifecycle-worker PRIVATE tools kvmem/include)
+find_package(Python3 COMPONENTS Interpreter QUIET)
+if (Python3_Interpreter_FOUND)
+    add_test(NAME kvmem-session-cache-lifecycle-test
+        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_session_cache_lifecycle.py
+                $<TARGET_FILE:kvmem-session-cache-lifecycle-worker>)
+    set_tests_properties(kvmem-session-cache-lifecycle-test PROPERTIES TIMEOUT 90)
+else()
+    message(STATUS "Python3 unavailable: session cache process lifecycle test is not registered")
+endif()
+
 option(KVMEM_BUILD_LLAMA "Build llama.cpp with the KVMem adapter" ON)
 option(KVMEM_ROCM "Build KVMem with the HIP/ROCm backend" OFF)
 if (KVMEM_ROCM)
