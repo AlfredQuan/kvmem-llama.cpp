@@ -29,10 +29,20 @@ def host_platform():
     raise ValueError('Supported build hosts are Windows and Linux (including WSL2).')
 
 
-def compiler_directory(root, target):
+def compiler_directory(root, target, env=None):
     name = 'clang++.exe' if target == 'windows' else 'clang++'
-    return next((root / suffix for suffix in ('bin', 'llvm/bin', 'lib/llvm/bin')
-                 if (root / suffix / name).is_file()), None)
+    explicit = (env or {}).get('ROCM_CLANG_BIN')
+    if explicit and (Path(explicit) / name).is_file():
+        return Path(explicit)
+    found = next((root / suffix for suffix in ('bin', 'llvm/bin', 'lib/llvm/bin')
+                  if (root / suffix / name).is_file()), None)
+    if found:
+        return found
+    # Distro packages (e.g. Ubuntu) split ROCm's clang into versioned LLVM trees.
+    for candidate in sorted(root.glob('lib/llvm-*/bin')):
+        if (candidate / name).is_file():
+            return candidate
+    return None
 
 
 def discover_rocm(explicit, env, target):
@@ -41,7 +51,7 @@ def discover_rocm(explicit, env, target):
         if target == 'linux' and re.match(r'^[A-Za-z]:[\\/]', selected):
             raise ValueError('Linux/WSL needs a Linux ROCm SDK, not the inherited Windows SDK path. Set --rocm to the Linux installation.')
         root = Path(selected).expanduser().resolve()
-        if not compiler_directory(root, target):
+        if not compiler_directory(root, target, env):
             raise ValueError('No AMD clang++ found under ROCm root: ' + str(root))
         return root
     # Resolve tool symlinks; never guess a machine-specific SDK root.
@@ -50,7 +60,7 @@ def discover_rocm(explicit, env, target):
         if not tool:
             continue
         for candidate in list(Path(tool).resolve().parents)[:4]:
-            if compiler_directory(candidate, target) and (candidate / 'include/hip/hip_runtime.h').is_file():
+            if compiler_directory(candidate, target, env) and (candidate / 'include/hip/hip_runtime.h').is_file():
                 return candidate
     raise ValueError('ROCm SDK not found. Put its tools on PATH, set ROCM_PATH/HIP_PATH, or pass --rocm. No driver or SDK is installed automatically.')
 
