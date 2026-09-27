@@ -39,6 +39,7 @@ struct llama_kvmem_params {
     float    blend_ratio;          // selected-history recomputation fraction; 0 disables
     float    blend_old_weight;     // 1-alpha; zero initialization preserves direct replacement
     bool     blend_neighbors;      // add original-history predecessor/successor of each core block
+    bool     blend_reset_recurrent; // temporary zero GDN/conv, restore query boundary after refresh
 };
 
 // Call before llama_init_from_model. A null pointer resets to defaults

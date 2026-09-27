@@ -644,6 +644,29 @@ static void check_blend(llama_model * model, ggml_type type, int mtp_state = 0) 
         std::printf("PASS BLEND_WEIGHT KV=%s mtp_state=%d alpha=%.2f: numerical K/V, exact GDN, source/index, restore\n",
                     ggml_type_name(type), mtp_state, alpha);
     }
+    if (hybrid) {
+        // Independent reference: zero just recurrent memory, run the unchanged
+        // carry path, then compare with the automatic reset/restore policy.
+        hybrid->get_mem_recr()->clear(true);
+        require(mem->blend(ctx.get(), .61f) == 96, "zero-state reference failed");
+        const auto zero_reference = selected_cache_values();
+        mem->blend_restore();
+        require(llama_state_seq_set_data_ext(ctx.get(), state.data(), state.size(), 0,
+                LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == state.size(), "reset test boundary restore failed");
+        require(mem->blend(ctx.get(), .61f, true, 1, false, true) == 96, "reset/restore blend failed");
+        require(recurrent() == state, "reset/restore changed the query boundary GDN/conv");
+        require(selected_cache_values() == zero_reference, "reset/restore did not compute from zero state");
+        require(zero_reference != old_values, "reset/restore failed to retain refreshed attention KV");
+        require(source() == original && mem->raw().mean_checkpoint(0) == mean, "reset/restore polluted source/index");
+        mem->blend_restore();
+        for (size_t i = 0; i < tensors.size(); ++i) compare(tensors[i], before[i]);
+        require(mem->blend(ctx.get(), .61f, true, 0, false, true) == 96, "reset/restore alpha0 failed");
+        require(recurrent() == state, "reset/restore alpha0 changed recurrent state");
+        for (size_t i = 0; i < tensors.size(); ++i) compare(tensors[i], before[i]);
+        mem->blend_restore();
+        std::printf("PASS BLEND_RESET_RESTORE KV=%s mtp_state=%d: zero-state reference, exact query boundary, refreshed KV, immutable source/index, alpha0 identity\n",
+                    ggml_type_name(type), mtp_state);
+    }
     // Future GPU KV must not influence recomputed history. Restore the same
     // live recurrent state, perturb only future rows, and repeat the batch.
     if (hybrid) require(llama_state_seq_set_data_ext(ctx.get(), state.data(), state.size(), 0,
@@ -698,7 +721,7 @@ static void check_blend(llama_model * model, ggml_type type, int mtp_state = 0) 
 
 // A neighbor stage-in must not resurrect the Query suffix removed before
 // replay, including in the live MTP follower (not just the target cache).
-static void check_blend_mtp_replay(llama_model * model) {
+static void check_blend_mtp_replay(llama_model * model, bool reset_recurrent = false) {
     llama_kvmem_params kp{};
     kp.enabled = true;
     kp.method = 1;
@@ -746,7 +769,16 @@ static void check_blend_mtp_replay(llama_model * model) {
     mem->runtime().store().set_retrieval_scores(scores);
     require(llama_kvmem_remove_logical(ctx.get(), query, -1) &&
             llama_kvmem_remove_logical(sess.ctx_dft, query, -1), "blend MTP query removal failed");
-    require(mem->blend(ctx.get(), .41f, true, 1, true) == 128, "blend MTP neighbor count differs");
+    const auto flags = LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY;
+    std::vector<uint8_t> boundary(llama_state_seq_get_size_ext(ctx.get(), 0, flags));
+    require(llama_state_seq_get_data_ext(ctx.get(), boundary.data(), boundary.size(), 0, flags) == boundary.size(),
+            "blend MTP boundary checkpoint failed");
+    require(mem->blend(ctx.get(), .41f, true, 1, true, reset_recurrent) == 128, "blend MTP neighbor count differs");
+    if (reset_recurrent) {
+        std::vector<uint8_t> after(boundary.size());
+        require(llama_state_seq_get_data_ext(ctx.get(), after.data(), after.size(), 0, flags) == after.size() && after == boundary,
+                "blend MTP recurrent boundary changed");
+    }
     for (uint32_t id : {4u, 7u}) require(mem->store().blocks()[id].gpu_slot >= 0, "blend MTP neighbor not staged in");
     require(mem->get_kv()->seq_pos_max(0) < query && mtp->seq_pos_max(0) < query,
             "neighbor stage-in resurrected removed Query rows");
@@ -897,6 +929,7 @@ int main(int argc, char ** argv) {
             check_blend(model.get(), GGML_TYPE_Q8_0);
             check_blend(model.get(), GGML_TYPE_Q8_0, 2);
             check_blend_mtp_replay(model.get());
+            check_blend_mtp_replay(model.get(), true);
             llama_kvmem_set_params(nullptr);
             model.reset();
             llama_backend_free();

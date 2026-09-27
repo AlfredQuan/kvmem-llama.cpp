@@ -24,18 +24,24 @@ same-query continuation fast paths do not refresh history unnecessarily.
    reselecting, spilling, removing, or truncating those rows. This reuses the
    existing CPU store, with no second GPU KV backup.
 
-For hybrid models, refresh **advances the current recurrent/conv state** across
-selected tokens. It neither clears that state nor restores it afterwards.
-Query Replay continues from the resulting state. The pre-existing query replay
-checkpoint is still restored before refresh starts. This is an approximation:
-it is not equivalent to replaying the entire retrieved window, nor to a dense
-causal prefill. MTP draft state is not advanced by history refresh; normal Query
-Replay updates its query suffix and hidden-state carry.
+For hybrid models, `--kvmem-blend-state carry` (default) advances the current
+recurrent/conv state across selected tokens. Query Replay continues from the
+resulting state. `--kvmem-blend-state reset-restore` instead checkpoints the
+query-boundary recurrent/conv state, clears it **once** before refresh, advances
+the temporary state across all selected spans, then restores the checkpoint.
+Refreshed attention KV stays in place. This follows qw3's GDN state policy;
+it does not change positions, batching, or retrieval. Both policies are
+approximations, not equivalent to replaying the entire retrieved window or a
+dense causal prefill. MTP draft state is not advanced by history refresh;
+normal Query Replay updates its query suffix and hidden-state carry.
 
 `KVMEM_BLEND` records tokens, blocks, consecutive runs, actual forward calls,
 and elapsed milliseconds when diagnostics are enabled (`--kvmem-trace`). The
 measurement includes selection, source preparation, and synchronized forwards.
-`prepare_ms` and `forward_ms` split that total into preparation and model work.
+`prepare_ms` includes source preparation and any recurrent checkpoint;
+`forward_ms` measures model work. `state_ms` separately reports the combined
+checkpoint, clear, and restore overhead (included in the total), and
+`state_bytes` records the host checkpoint size.
 It excludes later Query Replay and generation. Deferred source restoration is
 logged separately as `KVMEM_BLEND_RESTORE`.
 
@@ -61,8 +67,9 @@ Model weights are not downloaded by the test.
 (`0.5` keeps equal weights; the default `1` directly replaces KV). Both K and
 V are mixed **after all refresh forwards**, so alpha does not change the
 refreshed rows' forward trajectory or the recurrent-state update. `alpha=0`
-still runs refresh and advances recurrent state, then copies the original KV
-bytes back exactly; it is a diagnostic control, not equivalent to ratio `0`.
+still runs refresh, then copies the original KV bytes back exactly. In the
+default `carry` mode it also advances recurrent state, so it is a diagnostic
+control, not equivalent to ratio `0`.
 Weighted refresh currently supports CUDA F16/Q8_0 caches. Q8 operands are
 dequantized numerically, interpolated, and requantized, never mixed as bytes.
 The existing transfer slab supplies original CPU bytes, without a second GPU
@@ -85,3 +92,7 @@ count and mixing time. The total includes neighbor assembly and mixing;
 deduplication, budget and protected boundaries. The model-backed test also
 checks weighted K/V against a numerical reference, exact alpha-zero restoration,
 identical post-refresh GDN state across weights, and missing-neighbor stage-in.
+
+The reset/restore regression additionally checks an independent zero-state
+reference, byte-exact query-boundary restoration, preserved refreshed attention
+KV, immutable CPU KV/index, and successful target/MTP Query Replay.

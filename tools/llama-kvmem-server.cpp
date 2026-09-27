@@ -108,6 +108,7 @@ static void print_usage(const char * argv0) {
             "  --kvmem-blend-ratio R      experimental history refresh before query replay, 0..1 (default 0)\n"
             "  --kvmem-blend-alpha A      new KV weight after refresh, 0..1 (default 1)\n"
             "  --kvmem-blend-neighbors    refresh original predecessor/successor of each selected block\n"
+            "  --kvmem-blend-state MODE   carry (default) or reset-restore (qw3 GDN/conv policy)\n"
             "  --kvmem-block-tokens N     block size (default 128)\n"
             "  --kvmem-sink-tokens N      always-kept prefix; default 0 = one block; rounds down, minimum one block\n"
             "  --kvmem-gen-reserve N      decode slack (default 256)\n"
@@ -1658,6 +1659,13 @@ int main(int argc, char ** argv) {
             st.kparams.blend_old_weight = 1 - (float) kvmem_cli_real(arg, need(arg), 0, 1);
         } else if (eq(arg, "--kvmem-blend-neighbors")) {
             st.kparams.blend_neighbors = true;
+        } else if (eq(arg, "--kvmem-blend-state")) {
+            const char * mode = need(arg);
+            if (!eq(mode, "carry") && !eq(mode, "reset-restore")) {
+                fprintf(stderr, "invalid --kvmem-blend-state (want carry|reset-restore)\n");
+                return 1;
+            }
+            st.kparams.blend_reset_recurrent = eq(mode, "reset-restore");
         } else if (eq(arg, "--kvmem-block-tokens")) {
             st.kparams.block_tokens = (uint32_t) kvmem_cli_int(arg, need(arg));
         } else if (eq(arg, "--kvmem-gen-reserve")) {
@@ -1922,7 +1930,7 @@ int main(int argc, char ** argv) {
         {"kv", {{"k", ggml_type_name(st.cache_type_k)}, {"v", ggml_type_name(st.cache_type_v)}}},
         {"kvmem", {{"enabled", st.kparams.enabled}, {"budget", st.kparams.budget}, {"gen_reserve", st.kparams.gen_reserve},
                    {"sink_tokens", st.kparams.sink_tokens}, {"block_tokens", st.kparams.block_tokens}, {"blend_ratio", st.kparams.blend_ratio},
-                   {"blend_alpha", 1-st.kparams.blend_old_weight}, {"blend_neighbors", st.kparams.blend_neighbors}}},
+                   {"blend_alpha", 1-st.kparams.blend_old_weight}, {"blend_neighbors", st.kparams.blend_neighbors}, {"blend_state", st.kparams.blend_reset_recurrent ? "reset-restore" : "carry"}}},
         {"spec_type", st.spec_mtp ? "draft-mtp" : "none"},
         {"vision", {{"enabled", !mmproj_path.empty()}, {"projector", mmproj_path}, {"gpu", mmproj_gpu}}},
         {"http", {{"host", host}, {"port", port}, {"timeout", options.timeout}, {"slots", 1}}},
