@@ -140,6 +140,8 @@ insufficient temporary workspace without mutation, failures at each chunk's
 write/rename/read/validation/deletion boundary, partial I/O within a multi-vector
 chunk, failed temporary-file cleanup, wrong-session headers, bad checksums,
 decreasing available RAM, reverse recovery and exact packed KV restoration.
+For the opt-in **1:10** exchange and RTX 5060 Ti real-service stability check,
+see [1:10 multi-session exchange stability test](session-exchange-stability.md).
 
 Real model regression, including interleaved A/B/C histories, exact answers
 against a RAM reference, prefix cache hits, corruption fallback and eviction:

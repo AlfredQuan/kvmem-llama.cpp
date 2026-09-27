@@ -103,6 +103,30 @@ static void routes() {
     check(f.a.payload->complete() && f.files->bytes() == before, "final shortage changed cache");
 }
 
+// Opt-in stability run at one tenth of the original GiB scenario.  Each
+// allocation is a little over 102 MiB, so the planner must actually exchange
+// chunks instead of relying on enough RAM or disk for both whole sessions.
+static void scale_1to10() {
+    constexpr uint64_t unit = (uint64_t(1) << 30) / 10;
+    fixture f(unit, 15, 20);
+    for (int cycle = 0; cycle < 2; ++cycle) {
+        const auto forward = f.plan();
+        check(forward.route == kvmem_session_plan::path::exchange, "1:10 forward did not exchange chunks");
+        f.execute(forward); f.verify();
+        check(f.b.payload->complete() && f.a.payload->ram_bytes() == 0, "1:10 forward residency");
+        check(f.files->session_bytes(1) == f.a.payload->disk_bytes() && !f.files->contains(2),
+              "1:10 forward disk ownership");
+        const auto reverse = f.plan(true);
+        check(reverse.route == kvmem_session_plan::path::exchange, "1:10 reverse did not exchange chunks");
+        f.execute(reverse); f.verify();
+        check(f.a.payload->complete() && f.b.payload->ram_bytes() == 0, "1:10 reverse residency");
+    }
+    check(f.peak_ram <= 15*unit && f.peak_disk <= 20*unit, "1:10 transient capacity exceeded");
+    std::cout << "1:10 exchange passed: A=" << 10*unit << " B=" << 15*unit
+              << " disk_quota=" << 20*unit << " peak_ram=" << f.peak_ram
+              << " peak_disk=" << f.peak_disk << " bytes\n";
+}
+
 static void failure_matrix() {
     // Every write/read/publication/deletion boundary, including failures after
     // several chunks have moved. After each failure reconstruct the ORIGINAL
@@ -215,7 +239,15 @@ static void raw_roundtrip() {
     std::filesystem::remove(root);
 }
 
-int main() {
+int main(int argc, char ** argv) {
+    if (argc == 2 && std::string(argv[1]) == "--scale-1to10") {
+        scale_1to10();
+        return 0;
+    }
+    if (argc != 1) {
+        std::cerr << "usage: kvmem-session-transfer-test [--scale-1to10]\n";
+        return 2;
+    }
     routes(); failure_matrix(); corruption_and_pressure(); partial_io_and_cleanup(); raw_roundtrip();
     std::cout << "session exchange paths, 10/15/20 peaks, fault recovery, identity and raw KV passed\n";
 }
