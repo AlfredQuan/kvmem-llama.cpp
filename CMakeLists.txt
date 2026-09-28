@@ -286,7 +286,7 @@ if (KVMEM_BUILD_LLAMA)
         llama.cpp/tools/mtmd
         llama.cpp/vendor
         llama.cpp/vendor/cpp-httplib)
-    target_link_libraries(llama-kvmem-server PRIVATE llama llama-common cpp-httplib mtmd)
+    target_link_libraries(llama-kvmem-server PRIVATE llama llama-common cpp-httplib mtmd kvmem)
     target_compile_features(llama-kvmem-server PRIVATE cxx_std_17)
     # std::getenv is standard C++ and portable; MSVC marks it deprecated in
     # favour of the Windows-only _dupenv_s, and warns on the POSIX-ish helpers
