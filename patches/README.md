@@ -1,6 +1,7 @@
 # llama.cpp patch replay
 
-`llama-kvmem-current.patch` is the cumulative diff against pinned `b81c99b`.
+`llama-kvmem-current.patch` is the cumulative diff against the pinned
+llama.cpp `v0.5.0` release (`7fe450e19305b828c199d602c23a8337aaa1f03b`).
 It includes the existing KVMem hooks, multimodal batch, MTP, media
 parser and mtmd helper extensions, plus FP32 GDN Record/Fold for ReplaySSM.
 It also fixes reasoning-budget initialization from a template's generation prefix.
@@ -28,7 +29,7 @@ To check a clean extraction without changing the active submodule:
 
 ```bash
 mkdir -p /tmp/kvmem-llama-patch-check
-git -C llama.cpp archive b81c99b | tar -x -C /tmp/kvmem-llama-patch-check
+git -C llama.cpp archive 7fe450e19305b828c199d602c23a8337aaa1f03b | tar -x -C /tmp/kvmem-llama-patch-check
 KVMEM_LLAMA_DIR=/tmp/kvmem-llama-patch-check scripts/apply-patches.sh
 KVMEM_LLAMA_DIR=/tmp/kvmem-llama-patch-check scripts/apply-patches.sh
 ```

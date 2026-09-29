@@ -56,7 +56,7 @@ if (!$HostOnly) {
     $options += @('-DCMAKE_C_COMPILER=cl', '-DGGML_BACKEND_DL=OFF',
     '-DGGML_NATIVE=OFF', '-DGGML_AVX=ON', '-DGGML_AVX2=ON', '-DGGML_FMA=ON',
     '-DGGML_F16C=ON', '-DGGML_BMI2=ON', '-DGGML_AVX512=OFF',
-    '-DGGML_CUDA_FA_ALL_QUANTS=ON')
+    '-DGGML_CUDA_FA_QUANTS=all')
 }
 if ($HostOnly) {
     $options += '-DKVMEM_BUILD_LLAMA=OFF'
