@@ -4,6 +4,7 @@
 #include "llama-memory-kvmem-mtp.h"
 #include "llama-memory-kvmem-hybrid.h"
 #include "llama-kvmem-stagein.h"
+#include "llama-kvmem-quant.h"
 #include "llama-memory-recurrent.h"
 
 #include "ggml-backend.h"
@@ -24,6 +25,11 @@ struct test_spec_session : kvmem_spec_session {
 };
 
 struct kvmem_transfer_test_access {
+    static std::vector<float> read(const llama_memory_kvmem & mem, uint32_t id, int il, bool key) {
+        std::vector<float> values;
+        if (!mem.read_gpu_block(id, il, key, values)) throw std::runtime_error("cannot read blend KV");
+        return values;
+    }
     static bool complete(const llama_memory_kvmem & mem, uint32_t id, const llama_kv_cache * cache) {
         return mem.gpu_kv_complete(id, cache);
     }
@@ -416,6 +422,373 @@ static void check_replay_logits(llama_model * model, ggml_type type, int mtp_sta
     std::printf("PASS K=%s V=%s: unchanged view, explicit Q, stale plan rejection, replay logits\n", ggml_type_name(type), ggml_type_name(cp.type_v));
 }
 
+
+// Exercise real model forwards, quantized GPU rows and the packed CPU source.
+static void check_blend(llama_model * model, ggml_type type, int mtp_state = 0) {
+    llama_kvmem_params kp{};
+    kp.enabled = true;
+    kp.method = 1;
+    kp.block_tokens = 32;
+    kp.budget = 1024;
+    kp.gen_reserve = 256;
+    kp.query_begin = kp.query_end = kp.force_pos = -1;
+    kp.mtp_state = mtp_state;
+    llama_kvmem_set_params(&kp);
+    auto cp = llama_context_default_params();
+    cp.n_ctx = 2048;
+    cp.n_batch = cp.n_ubatch = 128;
+    cp.n_seq_max = 1;
+    cp.n_rs_seq = 3;
+    cp.type_k = cp.type_v = type;
+    cp.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
+    struct probe_data { int phase = 0; std::map<std::string, std::vector<float>> rows[2]; } probe;
+    cp.cb_eval_user_data = &probe;
+    cp.cb_eval = [](ggml_tensor * t, bool ask, void * user) {
+        auto & probe = *static_cast<probe_data *>(user);
+        const std::string name(t->name);
+        const bool needed = probe.phase > 0 && (name == "attn_norm-3" || name == "attn_pregate-3");
+        if (ask) return needed;
+        if (needed && t->type == GGML_TYPE_F32 && ggml_is_contiguous(t)) {
+            auto & rows = probe.rows[probe.phase-1][name];
+            size_t off = rows.size(); rows.resize(off+ggml_nelements(t));
+            ggml_backend_tensor_get(t, rows.data()+off, 0, ggml_nbytes(t));
+        }
+        return true;
+    };
+    std::unique_ptr<llama_context, decltype(&llama_free)> ctx(llama_init_from_model(model, cp), llama_free);
+    require(bool(ctx), "blend context init failed");
+    auto * hybrid = dynamic_cast<llama_memory_kvmem_hybrid *>(llama_get_memory(ctx.get()));
+    auto * mem = hybrid ? hybrid->attn_kvmem() : dynamic_cast<llama_memory_kvmem *>(llama_get_memory(ctx.get()));
+    require(mem != nullptr, "missing blend adapter");
+    std::string text;
+    for (int i = 0; i < 36; ++i) text += "Record " + std::to_string(i) + ": the secret code is 7391. Remember this number.\n";
+    auto input = common_tokenize(llama_model_get_vocab(model), text, true, true);
+    const int query = input.size();
+    auto question = common_tokenize(llama_model_get_vocab(model), "What is the secret code?", false, true);
+    input.insert(input.end(), question.begin(), question.end());
+    require(query > 384 && input.size() < 1024, "unexpected blend fixture length");
+    llama_kvmem_set_turn_spans({{{query, (int) input.size()}}, {{query, (int) input.size()}}, query});
+    auto decode = [&](int begin, int end) {
+        for (int row = begin; row < end;) {
+            const int n = std::min(128, end - row);
+            auto batch = llama_batch_get_one(input.data() + row, n);
+            std::vector<llama_pos> pos(4*n), logical(n);
+            for (int i = 0; i < n; ++i) {
+                logical[i] = row+i;
+                for (int a = 0; a < 4; ++a) pos[a*n+i] = row+i;
+            }
+            batch.pos = pos.data(); batch.logical_pos = logical.data();
+            require(llama_decode(ctx.get(), batch) == 0, "blend fixture decode failed");
+            row += n;
+        }
+        llama_synchronize(ctx.get());
+    };
+    decode(0, input.size());
+    auto selection = llama_kvmem_preview_retrieval();
+    selection.blocks = {0, 3, 5, 6, 9, selection.blocks.back()};
+    llama_kvmem_apply_selection(selection);
+    std::vector<double> scores(mem->store().block_count(), 0);
+    scores[5] = scores[6] = scores[9] = 1;
+    mem->runtime().store().set_retrieval_scores(scores);
+    for (uint32_t id : selection.blocks) kvmem_transfer_test_access::save(*mem, id);
+    kvmem_transfer_test_access::flush(*mem);
+    auto * kv = mem->get_kv();
+    std::vector<ggml_tensor *> tensors;
+    std::vector<std::vector<uint8_t>> before;
+    for (int il : kv->get_layer_ids()) {
+        for (auto * t : {kv->get_k_storage(il), kv->get_v_storage(il)}) {
+            tensors.push_back(t);
+            before.emplace_back(ggml_nbytes(t));
+            ggml_backend_tensor_get(t, before.back().data(), 0, before.back().size());
+        }
+    }
+    auto source = [&]() {
+        std::vector<uint8_t> result;
+        for (uint32_t id : selection.blocks) for (int il : kv->get_layer_ids()) {
+            const auto n = mem->store().blocks()[id].n_tokens;
+            const auto & cfg = mem->raw().config();
+            for (bool key : {true, false}) {
+                std::vector<uint8_t> bytes(n * (key ? cfg.k_gpu_row_bytes : cfg.v_gpu_row_bytes));
+                require(key ? mem->raw().copy_k_gpu(id, il, bytes.data(), n) :
+                              mem->raw().copy_v_gpu(id, il, bytes.data(), n), "missing packed source");
+                result.insert(result.end(), bytes.begin(), bytes.end());
+            }
+        }
+        for (uint32_t id : selection.blocks) for (int il : kv->get_layer_ids()) {
+            std::vector<float> mean(mem->n_embd_k());
+            mem->raw().mean_k(id, il, mean.data());
+            const auto * bytes = reinterpret_cast<const uint8_t *>(mean.data());
+            result.insert(result.end(), bytes, bytes + mean.size()*sizeof(float));
+        }
+        return result;
+    };
+    const auto original = source();
+    const auto mean = mem->raw().mean_checkpoint(0);
+    auto recurrent = [&]() {
+        std::vector<uint8_t> result;
+        if (hybrid) {
+            const auto flags = LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY;
+            result.resize(llama_state_seq_get_size_ext(ctx.get(), 0, flags));
+            require(llama_state_seq_get_data_ext(ctx.get(), result.data(), result.size(), 0, flags) == result.size(),
+                    "blend state capture failed");
+        }
+        return result;
+    };
+    const auto state = recurrent();
+    require(mem->blend(ctx.get(), 0) == 0, "disabled blend did work");
+    for (size_t i = 0; i < tensors.size(); ++i) compare(tensors[i], before[i]);
+    require(recurrent() == state, "disabled blend changed recurrent state");
+    auto selected_kv = [&]() {
+        std::vector<float> values;
+        for (uint32_t id : {5u, 6u, 9u}) for (int il : kv->get_layer_ids()) for (bool key : {true, false}) {
+            auto v = kvmem_transfer_test_access::read(*mem, id, il, key);
+            values.insert(values.end(), v.begin(), v.end());
+        }
+        return values;
+    };
+    auto selected_cache_values = [&]() {
+        std::vector<float> result;
+        for (uint32_t id : {5u,6u,9u}) for (int il : kv->get_layer_ids()) for (bool key : {true,false}) {
+            auto * t = key ? kv->get_k_storage(il) : kv->get_v_storage(il);
+            const auto & b = mem->store().blocks()[id];
+            const uint32_t dim = key ? mem->n_embd_k() : mem->n_embd_v();
+            const size_t stride = ggml_row_size(t->type, dim), begin = result.size();
+            std::vector<uint8_t> bytes(b.n_tokens*stride);
+            ggml_backend_tensor_get(t, bytes.data(), b.gpu_slot*32*stride, bytes.size());
+            result.resize(begin+b.n_tokens*dim);
+            require(kvmem_cache_unpack_rows(t->type, bytes.data(), result.data()+begin, b.n_tokens, dim),
+                    "cannot unpack cache-domain KV");
+        }
+        return result;
+    };
+    probe.phase = 1;
+    require(mem->blend(ctx.get(), .61f, false) == 96, "segmented reference failed");
+    const auto reference = selected_kv();
+    mem->blend_restore();
+    if (hybrid) require(llama_state_seq_set_data_ext(ctx.get(), state.data(), state.size(), 0,
+            LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == state.size(), "reference state restore failed");
+    probe.phase = 2;
+    // 5 complete history blocks * 32 * 0.61 -> 3 blocks, two causal runs.
+    require(mem->blend(ctx.get(), .61f) == 96, "blend selected unexpected token count");
+    probe.phase = 0;
+    require(probe.rows[0].size() == 2, "missing first-attention numerical probes");
+    for (const auto & entry : probe.rows[0]) {
+        const auto & a = entry.second, & b = probe.rows[1][entry.first];
+        require(a.size() == b.size(), "reference attention output size differs");
+        double e = 0, d = 0;
+        for (size_t i = 0; i < a.size(); ++i) { e += (a[i]-b[i])*(a[i]-b[i]); d += a[i]*a[i]; }
+        const double relative = std::sqrt(e/std::max(d,1e-20));
+        std::printf("BLEND_ATTENTION tensor=%s KV=%s relative_rmse=%.9f\n", entry.first.c_str(), ggml_type_name(type), relative);
+        // The preceding recurrent layers and quantized projections also vary
+        // with batch shape. Bound first-attention drift at 0.5%; causality and
+        // source preservation below are checked exactly, without a tolerance.
+        require(relative < .005, "sparse batching changed first attention beyond rounding tolerance");
+    }
+    const auto batched = selected_kv();
+    const auto advanced_state = recurrent();
+    const auto batched_cache = selected_cache_values();
+    double squared = 0, norm = 0, maximum = 0;
+    for (size_t i = 0; i < reference.size(); ++i) {
+        require(std::isfinite(reference[i]) && std::isfinite(batched[i]), "nonfinite refreshed KV");
+        const double d = batched[i] - reference[i];
+        squared += d*d; norm += reference[i]*reference[i]; maximum = std::max(maximum, std::abs(d));
+    }
+    const double relative_rmse = std::sqrt(squared / std::max(norm, 1e-20));
+    std::printf("BLEND_BATCH_NUMERICS KV=%s relative_rmse=%.9f maxabs=%.9f\n", ggml_type_name(type), relative_rmse, maximum);
+    // IQ3 activation quantization amplifies small attention rounding differences
+    // through later layers; report these separately from the causal/state tests.
+    size_t changed = 0;
+    for (size_t i = 0; i < tensors.size(); ++i) {
+        auto * t = tensors[i];
+        std::vector<uint8_t> actual(before[i].size());
+        ggml_backend_tensor_get(t, actual.data(), 0, actual.size());
+        const size_t stride = ggml_row_size(t->type, t->ne[0]);
+        for (size_t byte = 0; byte < actual.size(); ++byte) {
+            if (actual[byte] == before[i][byte]) continue;
+            const uint32_t slot = byte / stride / 32;
+            bool selected = false;
+            for (uint32_t id : {5u, 6u, 9u}) selected |= mem->store().blocks()[id].gpu_slot == (int) slot;
+            require(selected, "blend changed an unselected KV row");
+            ++changed;
+        }
+    }
+    require(changed > 0, "blend did not update any KV bytes");
+    require(source() == original && mem->raw().mean_checkpoint(0) == mean, "blend polluted source KV or index");
+    if (hybrid) require(recurrent() != state, "blend did not advance live recurrent state");
+    mem->blend_restore();
+    for (size_t i = 0; i < tensors.size(); ++i) compare(tensors[i], before[i]);
+    // Post-forward alpha must change only final KV, never the sparse forward
+    // trajectory/GDN state. Endpoints are exact; intermediate weights are
+    // compared against an independent numerical reference, including Q8 rounding.
+    const auto old_values = selected_cache_values();
+    for (float alpha : {0.0f, .25f, .5f}) {
+        if (hybrid) require(llama_state_seq_set_data_ext(ctx.get(), state.data(), state.size(), 0,
+                LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == state.size(), "weighted test state restore failed");
+        require(mem->blend(ctx.get(), .61f, true, alpha) == 96, "weighted blend token count differs");
+        require(recurrent() == advanced_state, "post-forward alpha changed recurrent state");
+        const auto actual = selected_cache_values();
+        require(actual.size() == batched_cache.size(), "weighted KV shape differs");
+        for (size_t begin = 0; begin < actual.size(); begin += 32) {
+            float maximum = 0;
+            for (size_t j = begin; j < begin+32; ++j)
+                maximum = std::max(maximum, std::abs((1-alpha)*old_values[j] + alpha*batched_cache[j]));
+            const float tolerance = maximum*(type == GGML_TYPE_Q8_0 ? .5f/127 + .001f : .001f) + 1e-6f;
+            for (size_t j = begin; j < begin+32; ++j)
+                require(std::abs(actual[j]-((1-alpha)*old_values[j]+alpha*batched_cache[j])) <= tolerance,
+                        "weighted KV differs from numerical interpolation");
+        }
+        if (alpha == 0) for (size_t i = 0; i < tensors.size(); ++i) compare(tensors[i], before[i]);
+        require(source() == original && mem->raw().mean_checkpoint(0) == mean, "weighted blend polluted source/index");
+        mem->blend_restore();
+        for (size_t i = 0; i < tensors.size(); ++i) compare(tensors[i], before[i]);
+        std::printf("PASS BLEND_WEIGHT KV=%s mtp_state=%d alpha=%.2f: numerical K/V, exact GDN, source/index, restore\n",
+                    ggml_type_name(type), mtp_state, alpha);
+    }
+    if (hybrid) {
+        // Independent reference: zero just recurrent memory, run the unchanged
+        // carry path, then compare with the automatic reset/restore policy.
+        hybrid->get_mem_recr()->clear(true);
+        require(mem->blend(ctx.get(), .61f) == 96, "zero-state reference failed");
+        const auto zero_reference = selected_cache_values();
+        mem->blend_restore();
+        require(llama_state_seq_set_data_ext(ctx.get(), state.data(), state.size(), 0,
+                LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == state.size(), "reset test boundary restore failed");
+        require(mem->blend(ctx.get(), .61f, true, 1, false, true) == 96, "reset/restore blend failed");
+        require(recurrent() == state, "reset/restore changed the query boundary GDN/conv");
+        require(selected_cache_values() == zero_reference, "reset/restore did not compute from zero state");
+        require(zero_reference != old_values, "reset/restore failed to retain refreshed attention KV");
+        require(source() == original && mem->raw().mean_checkpoint(0) == mean, "reset/restore polluted source/index");
+        mem->blend_restore();
+        for (size_t i = 0; i < tensors.size(); ++i) compare(tensors[i], before[i]);
+        require(mem->blend(ctx.get(), .61f, true, 0, false, true) == 96, "reset/restore alpha0 failed");
+        require(recurrent() == state, "reset/restore alpha0 changed recurrent state");
+        for (size_t i = 0; i < tensors.size(); ++i) compare(tensors[i], before[i]);
+        mem->blend_restore();
+        std::printf("PASS BLEND_RESET_RESTORE KV=%s mtp_state=%d: zero-state reference, exact query boundary, refreshed KV, immutable source/index, alpha0 identity\n",
+                    ggml_type_name(type), mtp_state);
+    }
+    // Future GPU KV must not influence recomputed history. Restore the same
+    // live recurrent state, perturb only future rows, and repeat the batch.
+    if (hybrid) require(llama_state_seq_set_data_ext(ctx.get(), state.data(), state.size(), 0,
+            LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == state.size(), "causal probe state restore failed");
+    const auto & future = mem->store().blocks()[selection.blocks.back()];
+    for (auto * t : tensors) {
+        const size_t stride = ggml_row_size(t->type, t->ne[0]);
+        std::vector<uint8_t> zero(future.n_tokens * stride, 0);
+        ggml_backend_tensor_set(t, zero.data(), future.gpu_slot * 32 * stride, zero.size());
+    }
+    require(mem->blend(ctx.get(), .61f) == 96, "causal probe blend failed");
+    require(selected_kv() == batched, "future GPU KV changed historical recomputation");
+    mem->blend_restore();
+    for (size_t i = 0; i < tensors.size(); ++i) {
+        const size_t stride = ggml_row_size(tensors[i]->type, tensors[i]->ne[0]);
+        const size_t offset = future.gpu_slot * 32 * stride;
+        ggml_backend_tensor_set(tensors[i], before[i].data() + offset, offset, future.n_tokens * stride);
+    }
+    // A second update must still read the canonical packed source, and a new
+    // selection must restore overwritten rows before changing their GPU slots.
+    require(mem->blend(ctx.get(), .61f) == 96, "second blend failed");
+    auto again = llama_kvmem_preview_retrieval();
+    again.blocks = selection.blocks;
+    llama_kvmem_apply_selection(again);
+    for (size_t i = 0; i < tensors.size(); ++i) compare(tensors[i], before[i]);
+    require(source() == original, "reselection polluted source KV");
+    // Core blocks 5/6 bring original 4/7 from CPU, evicting unprotected 3/9
+    // without growing the window; a sparse-window neighbor is never substituted.
+    mem->runtime().store().set_retrieval_scores(scores);
+    const auto resident_before = mem->attention_view().blocks.size();
+    const auto neighbor_source = source();
+    require(mem->blend(ctx.get(), .41f, true, 1, true) == 128, "neighbor expansion token count differs");
+    require(mem->attention_view().blocks.size() == resident_before, "neighbor expansion grew GPU window");
+    for (uint32_t id : {4u,5u,6u,7u}) require(mem->store().blocks()[id].gpu_slot >= 0, "original neighbor absent");
+    for (uint32_t id : {3u,9u}) require(mem->store().blocks()[id].gpu_slot < 0, "wrong neighbor victim");
+    require(source() == neighbor_source, "neighbor refresh polluted original KV/index");
+    mem->blend_restore();
+    std::printf("PASS BLEND_NEIGHBORS KV=%s mtp_state=%d tokens=128 core=2 expanded=4 added=2 evicted=2\n", ggml_type_name(type), mtp_state);
+    again = llama_kvmem_preview_retrieval();
+    again.blocks = selection.blocks;
+    llama_kvmem_apply_selection(again);
+    require(mem->blend(ctx.get(), .61f) == 96, "third blend failed");
+    require(llama_kvmem_remove_logical(ctx.get(), query, -1), "query removal failed");
+    llama_kvmem_set_replay(true);
+    decode(query, input.size());
+    llama_kvmem_set_replay(false);
+    const auto * logits = llama_get_logits_ith(ctx.get(), -1);
+    const int vocab = llama_vocab_n_tokens(llama_model_get_vocab(model));
+    require(logits && std::all_of(logits, logits+vocab, [](float x) { return std::isfinite(x); }), "nonfinite blend query logits");
+    std::printf("PASS BLEND KV=%s mtp_state=%d tokens=96 runs=2 changed_bytes=%zu: disabled identity, selective rows, immutable source/index, restore, reselect, live recurrent, query replay\n", ggml_type_name(type), mtp_state, changed);
+}
+
+// A neighbor stage-in must not resurrect the Query suffix removed before
+// replay, including in the live MTP follower (not just the target cache).
+static void check_blend_mtp_replay(llama_model * model, bool reset_recurrent = false) {
+    llama_kvmem_params kp{};
+    kp.enabled = true;
+    kp.method = 1;
+    kp.block_tokens = 32;
+    kp.budget = 1024;
+    kp.gen_reserve = 256;
+    kp.query_begin = kp.query_end = kp.force_pos = -1;
+    kp.mtp_state = 2;
+    llama_kvmem_set_params(&kp);
+    auto cp = llama_context_default_params();
+    cp.n_ctx = 2048;
+    cp.n_batch = cp.n_ubatch = 128;
+    cp.n_seq_max = 1;
+    cp.n_rs_seq = 3;
+    cp.type_k = cp.type_v = GGML_TYPE_Q8_0;
+    cp.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
+    std::unique_ptr<llama_context, decltype(&llama_free)> ctx(llama_init_from_model(model, cp), llama_free);
+    require(bool(ctx), "blend MTP context init failed");
+    kvmem_spec_opts opts;
+    opts.kvmem_enabled = true;
+    opts.n_ctx = cp.n_ctx;
+    opts.n_batch = opts.n_ubatch = cp.n_batch;
+    opts.n_max = 3;
+    opts.draft_type = GGML_TYPE_F16;
+    test_spec_session sess;
+    require(kvmem_spec_start(sess, model, ctx.get(), opts), "blend MTP init failed");
+    auto * mtp = dynamic_cast<llama_memory_kvmem_mtp *>(llama_get_memory(sess.ctx_dft));
+    require(mtp != nullptr, "missing blend MTP follower");
+    auto * mem = mtp->target();
+    std::string text;
+    for (int i = 0; i < 36; ++i) text += "Record " + std::to_string(i) + ": the secret code is 7391. Remember this number.\n";
+    auto input = common_tokenize(llama_model_get_vocab(model), text, true, true);
+    const int query = input.size();
+    auto question = common_tokenize(llama_model_get_vocab(model), "What is the secret code?", false, true);
+    input.insert(input.end(), question.begin(), question.end());
+    require(query > 384 && input.size() < 1024, "unexpected blend MTP fixture length");
+    llama_kvmem_set_turn_spans({{{query, (int) input.size()}}, {{query, (int) input.size()}}, query});
+    require(kvmem_spec_decode_span(ctx.get(), sess.spec, input.data(), 0, input.size(), 128, "blend MTP probe") == 0,
+            "blend MTP probe failed");
+    auto selection = llama_kvmem_preview_retrieval();
+    selection.blocks = {0, 3, 5, 6, 9, selection.blocks.back()};
+    llama_kvmem_apply_selection(selection);
+    std::vector<double> scores(mem->store().block_count(), 0);
+    scores[5] = scores[6] = scores[9] = 1;
+    mem->runtime().store().set_retrieval_scores(scores);
+    require(llama_kvmem_remove_logical(ctx.get(), query, -1) &&
+            llama_kvmem_remove_logical(sess.ctx_dft, query, -1), "blend MTP query removal failed");
+    const auto flags = LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY;
+    std::vector<uint8_t> boundary(llama_state_seq_get_size_ext(ctx.get(), 0, flags));
+    require(llama_state_seq_get_data_ext(ctx.get(), boundary.data(), boundary.size(), 0, flags) == boundary.size(),
+            "blend MTP boundary checkpoint failed");
+    require(mem->blend(ctx.get(), .41f, true, 1, true, reset_recurrent) == 128, "blend MTP neighbor count differs");
+    if (reset_recurrent) {
+        std::vector<uint8_t> after(boundary.size());
+        require(llama_state_seq_get_data_ext(ctx.get(), after.data(), after.size(), 0, flags) == after.size() && after == boundary,
+                "blend MTP recurrent boundary changed");
+    }
+    for (uint32_t id : {4u, 7u}) require(mem->store().blocks()[id].gpu_slot >= 0, "blend MTP neighbor not staged in");
+    require(mem->get_kv()->seq_pos_max(0) < query && mtp->seq_pos_max(0) < query,
+            "neighbor stage-in resurrected removed Query rows");
+    llama_kvmem_set_replay(true);
+    require(kvmem_spec_decode_span(ctx.get(), sess.spec, input.data(), query, input.size(), 128, "blend MTP replay") == 0,
+            "blend MTP query replay failed");
+    llama_kvmem_set_replay(false);
+    std::puts("PASS BLEND_MTP_REPLAY: cold original neighbors, trimmed target/draft suffix, live MTP replay");
+}
+
 struct gdn_model_result {
     std::vector<float> logits;
     std::vector<uint64_t> states;
@@ -537,8 +910,9 @@ static void check_gdn_transactions(llama_model * model, ggml_type type, int draf
 
 int main(int argc, char ** argv) {
     const bool target_only = argc == 3 && std::string(argv[2]) == "--target-only";
-    if (argc != 2 && !target_only) {
-        std::fprintf(stderr, "Usage: %s model.gguf [--target-only] (requires CUDA; full suite requires Qwen 27B MTP weights)\n", argv[0]);
+    const bool blend_only = argc == 3 && std::string(argv[2]) == "--blend-only";
+    if (argc != 2 && !target_only && !blend_only) {
+        std::fprintf(stderr, "Usage: %s model.gguf [--target-only|--blend-only] (requires CUDA; full suite requires Qwen 27B MTP weights)\n", argv[0]);
         return argc == 1 ? 77 : 1;
     }
     try {
@@ -550,6 +924,17 @@ int main(int argc, char ** argv) {
         std::unique_ptr<llama_model, decltype(&llama_model_free)> model(
                 llama_model_load_from_file(argv[1], mp), llama_model_free);
         require(bool(model), "model load failed");
+        if (blend_only) {
+            check_blend(model.get(), GGML_TYPE_F16);
+            check_blend(model.get(), GGML_TYPE_Q8_0);
+            check_blend(model.get(), GGML_TYPE_Q8_0, 2);
+            check_blend_mtp_replay(model.get());
+            check_blend_mtp_replay(model.get(), true);
+            llama_kvmem_set_params(nullptr);
+            model.reset();
+            llama_backend_free();
+            return 0;
+        }
         check_batch_inputs(model.get());
 
         llama_kvmem_params kp{};

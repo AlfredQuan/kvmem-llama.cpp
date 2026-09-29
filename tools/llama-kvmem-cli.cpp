@@ -1,6 +1,7 @@
 #include "llama.h"
 #include "llama-kvmem-hooks.h"
 #include "kvmem-spec.h"
+#include "kvmem-server-options.h"
 #include "kvmem-server-devices.h"
 
 #include <algorithm>
@@ -35,6 +36,10 @@ static void print_usage(const char * argv0) {
             "  --kvmem                    enable KVMem slot-pool memory\n"
             "  --kvmem-block-tokens N     block size (default 32)\n"
             "  --kvmem-budget N           GPU working-set tokens; 0 = n_ctx (identity)\n"
+            "  --kvmem-blend-ratio R      experimental history refresh before query replay, 0..1 (default 0)\n"
+            "  --kvmem-blend-alpha A      new KV weight after refresh, 0..1 (default 1)\n"
+            "  --kvmem-blend-neighbors    refresh original predecessor/successor of each selected block\n"
+            "  --kvmem-blend-state MODE   carry (default) or reset-restore (qw3 GDN/conv policy)\n"
             "  --kvmem-gen-reserve N      extra GPU tokens for decode (default 256)\n"
             "  --kvmem-sink-tokens N      always-kept prefix; 0 = one block\n"
             "  --kvmem-recent-tokens N    always-kept suffix blocks (default 0)\n"
@@ -156,6 +161,19 @@ int main(int argc, char ** argv) {
             kparams.block_tokens = static_cast<uint32_t>(std::atoi(need(arg)));
         } else if (eq(arg, "--kvmem-budget")) {
             kparams.budget = static_cast<uint32_t>(std::atoi(need(arg)));
+        } else if (eq(arg, "--kvmem-blend-ratio")) {
+            kparams.blend_ratio = (float) kvmem_cli_real(arg, need(arg), 0, 1);
+        } else if (eq(arg, "--kvmem-blend-alpha")) {
+            kparams.blend_old_weight = 1 - (float) kvmem_cli_real(arg, need(arg), 0, 1);
+        } else if (eq(arg, "--kvmem-blend-neighbors")) {
+            kparams.blend_neighbors = true;
+        } else if (eq(arg, "--kvmem-blend-state")) {
+            const char * mode = need(arg);
+            if (!eq(mode, "carry") && !eq(mode, "reset-restore")) {
+                fprintf(stderr, "invalid --kvmem-blend-state (want carry|reset-restore)\n");
+                return 1;
+            }
+            kparams.blend_reset_recurrent = eq(mode, "reset-restore");
         } else if (eq(arg, "--kvmem-gen-reserve")) {
             kparams.gen_reserve = static_cast<uint32_t>(std::atoi(need(arg)));
         } else if (eq(arg, "--kvmem-sink-tokens")) {
@@ -554,6 +572,7 @@ int main(int argc, char ** argv) {
             llama_kvmem_trace_cells(ctx, "after_gdn_restore");
         }
         llama_memory_t mem = llama_get_memory(ctx);
+        llama_kvmem_blend(ctx);
         llama_kvmem_set_replay(true);
         if (mem) {
             fprintf(stderr, "KVMEM_TRACE before_seq_rm seq_pos=[%d,%d] query=[%d,%d)\n",

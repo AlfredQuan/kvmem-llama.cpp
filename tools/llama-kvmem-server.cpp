@@ -117,6 +117,10 @@ static void print_usage(const char * argv0) {
             "                            request fields override these process defaults\n"
             "  --kvmem / --no-kvmem       enable KVMem (default on)\n"
             "  --kvmem-budget N           GPU working-set tokens; 0 = n_ctx\n"
+            "  --kvmem-blend-ratio R      experimental history refresh before query replay, 0..1 (default 0)\n"
+            "  --kvmem-blend-alpha A      new KV weight after refresh, 0..1 (default 1)\n"
+            "  --kvmem-blend-neighbors    refresh original predecessor/successor of each selected block\n"
+            "  --kvmem-blend-state MODE   carry (default) or reset-restore (qw3 GDN/conv policy)\n"
             "  --kvmem-block-tokens N     block size (default 128)\n"
             "  --kvmem-sink-tokens N      always-kept prefix; default 0 = one block; rounds down, minimum one block\n"
             "  --kvmem-gen-reserve N      decode slack (default 256)\n"
@@ -1472,6 +1476,7 @@ static bool run_prefill_retrieval(ServerState & st, const std::vector<llama_toke
                             llama_memory_seq_pos_min(md, 0), llama_memory_seq_pos_max(md, 0));
                 }
             }
+            llama_kvmem_blend(ctx);
             if (!replay(q0, q1, "query replay")) {
                 return false;
             }
@@ -2368,6 +2373,19 @@ int main(int argc, char ** argv) {
             st.kparams.enabled = false;
         } else if (eq(arg, "--kvmem-budget")) {
             st.kparams.budget = (uint32_t) kvmem_cli_int(arg, need(arg));
+        } else if (eq(arg, "--kvmem-blend-ratio")) {
+            st.kparams.blend_ratio = (float) kvmem_cli_real(arg, need(arg), 0, 1);
+        } else if (eq(arg, "--kvmem-blend-alpha")) {
+            st.kparams.blend_old_weight = 1 - (float) kvmem_cli_real(arg, need(arg), 0, 1);
+        } else if (eq(arg, "--kvmem-blend-neighbors")) {
+            st.kparams.blend_neighbors = true;
+        } else if (eq(arg, "--kvmem-blend-state")) {
+            const char * mode = need(arg);
+            if (!eq(mode, "carry") && !eq(mode, "reset-restore")) {
+                fprintf(stderr, "invalid --kvmem-blend-state (want carry|reset-restore)\n");
+                return 1;
+            }
+            st.kparams.blend_reset_recurrent = eq(mode, "reset-restore");
         } else if (eq(arg, "--kvmem-block-tokens")) {
             st.kparams.block_tokens = (uint32_t) kvmem_cli_int(arg, need(arg));
         } else if (eq(arg, "--kvmem-gen-reserve")) {
@@ -2673,7 +2691,8 @@ int main(int argc, char ** argv) {
         {"n_predict", st.n_predict_default},
         {"kv", {{"k", ggml_type_name(st.cache_type_k)}, {"v", ggml_type_name(st.cache_type_v)}}},
         {"kvmem", {{"enabled", st.kparams.enabled}, {"budget", st.kparams.budget}, {"gen_reserve", st.kparams.gen_reserve},
-                   {"sink_tokens", st.kparams.sink_tokens}, {"block_tokens", st.kparams.block_tokens}}},
+                   {"sink_tokens", st.kparams.sink_tokens}, {"block_tokens", st.kparams.block_tokens}, {"blend_ratio", st.kparams.blend_ratio},
+                   {"blend_alpha", 1-st.kparams.blend_old_weight}, {"blend_neighbors", st.kparams.blend_neighbors}, {"blend_state", st.kparams.blend_reset_recurrent ? "reset-restore" : "carry"}}},
         {"spec_type", st.spec_mtp ? "draft-mtp" : "none"},
         {"vision", {{"enabled", !mmproj_path.empty()}, {"projector", mmproj_path}, {"gpu", mmproj_gpu},
                     {"device", mmproj_gpu ? (mmproj_device_name.empty() ? "auto" : mmproj_device_name) : "CPU"}}},
@@ -2976,6 +2995,34 @@ int main(int argc, char ** argv) {
         res.set_content(j.dump(), "application/json");
     });
 
+    const bool benchmark_api = std::getenv("KVMEM_BENCHMARK_API") &&
+        std::strcmp(std::getenv("KVMEM_BENCHMARK_API"), "1") == 0;
+    auto benchmark_memory = [&]() {
+        const auto b = llama_kvmem_benchmark_memory();
+        return json{{"gpu_main_kv_allocated_bytes", b[0]}, {"gpu_draft_kv_allocated_bytes", b[1]},
+            {"cpu_kv_payload_bytes", b[2]}, {"cpu_kv_allocated_bytes", b[3]},
+            {"cpu_index_payload_bytes", b[4]}, {"cpu_index_allocated_bytes", b[5]},
+            {"stored_tokens", llama_kvmem_store_n_tokens()},
+            {"checkpoint_live_bytes", st.mm_checkpoint_accounting->live_bytes},
+            {"checkpoint_peak_bytes", st.mm_checkpoint_accounting->peak_bytes}};
+    };
+    if (benchmark_api) {
+        svr.Post("/benchmark/tokenize", [&](const httplib::Request & req, httplib::Response & res) {
+            try {
+                std::lock_guard<std::mutex> lock(st.mu);
+                const auto body = json::parse(req.body);
+                const auto tokens = tokenize_text(st.vocab, body.at("text").get<std::string>(), body.value("add_special", false));
+                res.set_content(json{{"tokens", tokens}}.dump(), "application/json");
+            } catch (const std::exception & e) {
+                res.status = 400;
+                res.set_content(json{{"error", e.what()}}.dump(), "application/json");
+            }
+        });
+        svr.Get("/benchmark/memory", [&](const httplib::Request &, httplib::Response & res) {
+            std::lock_guard<std::mutex> lock(st.mu);
+            res.set_content(benchmark_memory().dump(), "application/json");
+        });
+    }
     // Diagnostic: dump each /v1/responses request, and the Chat Completions body
     // it converts to, into $KVMEM_DBG_DIR. A client whose request this server
     // only half-understands is invisible on the wire -- it gets a well-formed but
@@ -3025,6 +3072,14 @@ int main(int argc, char ** argv) {
             res.set_content(json{{"error", e.what()}}.dump(), "application/json");
             return;
         }
+        const bool benchmark_request = body.contains("benchmark_input_ids") ||
+            body.contains("benchmark_render_only") || body.contains("prefill_only");
+        if (benchmark_request && !benchmark_api) {
+            res.status = 400;
+            res.set_content("{\"error\":\"benchmark API is disabled\"}", "application/json");
+            return;
+        }
+        const bool prefill_only = benchmark_api && body.value("prefill_only", false);
         ChatRequest cr;
         cr.max_tokens = st.n_predict_default;
         cr.enable_thinking = st.enable_thinking_default;
@@ -3042,6 +3097,14 @@ int main(int argc, char ** argv) {
             res.status = 400;
             res.set_content("{\"error\":\"cache_reset must be a boolean\"}", "application/json");
             return;
+        }
+        if (prefill_only) {
+            if (cr.stream || !body.contains("benchmark_input_ids")) {
+                res.status = 400;
+                res.set_content("{\"error\":\"prefill_only requires token input and non-streaming mode\"}", "application/json");
+                return;
+            }
+            cr.max_tokens = 0;
         }
 
         cr.sampling = kvmem_chat_sampling_defaults(cr.enable_thinking);
@@ -3087,12 +3150,22 @@ int main(int argc, char ** argv) {
         const std::string & prompt = formatted.prompt;
         std::shared_ptr<kvmem_prompt> parsed_prompt;
         try {
-            parsed_prompt = media_files.empty()
+            if (benchmark_api && body.contains("benchmark_input_ids")) {
+                const auto ids = body.at("benchmark_input_ids").get<std::vector<llama_token>>();
+                for (const auto id : ids) {
+                    if (id < 0 || id >= llama_vocab_n_tokens(st.vocab)) throw std::invalid_argument("invalid benchmark token ID");
+                }
+                parsed_prompt = std::make_shared<kvmem_prompt>(ids);
+            } else parsed_prompt = media_files.empty()
                 ? std::make_shared<kvmem_prompt>(tokenize_text(st.vocab, prompt, true))
                 : st.vision->tokenize(prompt, media_files);
         } catch (const std::exception & e) {
             res.status = 400;
             res.set_content(json{{"error", e.what()}}.dump(), "application/json");
+            return;
+        }
+        if (benchmark_api && body.value("benchmark_render_only", false)) {
+            res.set_content(json{{"prompt", prompt}, {"tokens", parsed_prompt->tokens}}.dump(), "application/json");
             return;
         }
         st.active_prompt = parsed_prompt;
@@ -3130,6 +3203,11 @@ int main(int argc, char ** argv) {
             qbegin = std::max(last_media_end, qend - st.query_max_tokens);
         }
         clamp_query_span(st, qbegin, qend);
+        if (prefill_only) {
+            qbegin = qend = (int) toks.size();
+            st.turn_query_exact = false;
+            st.turn_last_user.clear();
+        }
         if (st.turn_query_exact && std::find(toks.begin() + qbegin, toks.begin() + qend, LLAMA_TOKEN_NULL) != toks.begin() + qend) {
             st.turn_query_exact = false;
             kvmem_diag("KVMEM_TRACE query_loc fallback=explicit_span_contains_media\n");
@@ -3662,6 +3740,16 @@ int main(int argc, char ** argv) {
         llama_kvmem_end_prefill_capture();
         st.mm_live_checkpoint.reset();
         auto emit_gen_wall = make_emit_gen_wall(t_turn0, t_pf1, prefill_ms, n_cache_hit);
+
+        if (prefill_only) {
+            emit_gen_wall(0);
+            commit_cached(st, toks, {});
+            res.set_content(json{{"prefill_only", true}, {"usage", {
+                {"prompt_tokens", toks.size()}, {"completion_tokens", 0},
+                {"prompt_cache_hit_tokens", n_cache_hit}}},
+                {"timings", *timings}, {"memory", benchmark_memory()}}.dump(), "application/json");
+            return;
+        }
 
         if (use_spec) {
             std::string content;

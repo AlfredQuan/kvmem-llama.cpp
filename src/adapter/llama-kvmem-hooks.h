@@ -36,6 +36,10 @@ struct llama_kvmem_params {
     bool     raw_k_nvme;           // put raw-K/V authority on NVMe (qw3-style)
     bool     harvest_v;            // prefill D2H V with K (default off; not implied by raw_k_nvme)
     int32_t  mtp_state;            // 0 snapshots, 1 auto, 2 replay
+    float    blend_ratio;          // selected-history recomputation fraction; 0 disables
+    float    blend_old_weight;     // 1-alpha; zero initialization preserves direct replacement
+    bool     blend_neighbors;      // add original-history predecessor/successor of each core block
+    bool     blend_reset_recurrent; // temporary zero GDN/conv, restore query boundary after refresh
 };
 
 // Call before llama_init_from_model. A null pointer resets to defaults
@@ -147,6 +151,8 @@ LLAMA_API void llama_kvmem_apply_retrieval(struct llama_context * ctx);
 // (qw3 kvmem_replay_capacity). False → skip query seq_rm/replay.
 LLAMA_API bool llama_kvmem_query_replay_fits(uint32_t query_begin, uint32_t prompt_end);
 LLAMA_API void llama_kvmem_set_replay(bool replay);
+// Refresh selected history before query replay; preserve source KV, advance live recurrent state.
+LLAMA_API uint32_t llama_kvmem_blend(struct llama_context * ctx);
 LLAMA_API void llama_kvmem_trace_cells(struct llama_context * ctx, const char * tag);
 // True when the active KVMem memory is hybrid (attn slot-pool + stock GDN).
 LLAMA_API bool llama_kvmem_has_recurrent(void);
@@ -186,6 +192,8 @@ struct llama_kvmem_transfer_stats {
     uint64_t calls[3] = {};
 };
 LLAMA_API llama_kvmem_transfer_stats llama_kvmem_get_transfer_stats();
+// GPU main/draft KV capacity, then host KV payload/capacity and index payload/capacity.
+LLAMA_API std::vector<uint64_t> llama_kvmem_benchmark_memory();
 void kvmem_record_transfer(int cuda_kind, uint64_t bytes);
 struct llama_kvmem_turn_spans {
     std::vector<llama_kvmem_row_range> query;

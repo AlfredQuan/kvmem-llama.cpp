@@ -36,6 +36,10 @@ bool kvmem_stagein_enqueue_k(
         int64_t * copy_us, int64_t * rope_us, int64_t * hadamard_us, int64_t * set_us);
 bool kvmem_stagein_enqueue_v(const void * packed, size_t nbytes, uint8_t * dst,
                              int64_t * set_us);
+// Both operands are already in the same cache representation/position. Mix
+// numerically, requantizing Q8_0; alpha=0 copies the original bytes exactly.
+bool kvmem_stagein_enqueue_mix(ggml_type ty, const void * original, size_t nbytes,
+                               uint8_t * dst, float alpha);
 bool kvmem_stagein_flush(int64_t * copy_us, int64_t * rope_us,
                          int64_t * hadamard_us, int64_t * set_us);
 

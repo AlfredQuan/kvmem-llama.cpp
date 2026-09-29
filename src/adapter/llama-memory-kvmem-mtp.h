@@ -52,6 +52,9 @@ public:
     llama_pos seq_pos_max(llama_seq_id seq_id) const override;
 
     std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const override;
+    std::vector<uint64_t> benchmark_host_bytes() const {
+        return raw_ ? raw_->benchmark_bytes() : std::vector<uint64_t>(4, 0);
+    }
 
     void state_write(llama_io_write_i & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) const override;
     void state_read (llama_io_read_i  & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) override;

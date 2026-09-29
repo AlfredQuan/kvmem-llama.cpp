@@ -125,6 +125,11 @@ void llama_memory_kvmem_hybrid::clear(bool data) {
     }
 }
 
+llama_pos llama_memory_kvmem_hybrid::seq_pos_max(llama_seq_id seq_id) const {
+    return attn_kvmem_->blend_active() ? attn_kvmem_->seq_pos_max(seq_id)
+                                     : llama_memory_hybrid::seq_pos_max(seq_id);
+}
+
 bool llama_memory_kvmem_hybrid::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
     const llama_pos p0n = p0 < 0 ? 0 : p0;
     const bool full = seq_id <= 0 && p0n == 0 && p1 < 0;

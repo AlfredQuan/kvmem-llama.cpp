@@ -90,6 +90,21 @@ public:
     // Caller freezes the detached store until all bindings have been restored.
     void snapshot_buffers(std::vector<SnapshotBuffer> & buffers);
 
+    // Benchmark counters: KV payload, KV capacity, index payload, index capacity.
+    std::vector<uint64_t> benchmark_bytes() const {
+        std::lock_guard<std::mutex> lk(mu_);
+        std::vector<uint64_t> out(4, 0);
+        for (const auto & block : blocks_) for (const auto & layer : block.layers) {
+            out[0] += layer.k.size() + layer.v.size() * sizeof(uint16_t)
+                    + layer.k_gpu.size() + layer.v_gpu.size();
+            out[1] += layer.k.capacity() + layer.v.capacity() * sizeof(uint16_t)
+                    + layer.k_gpu.capacity() + layer.v_gpu.capacity();
+            out[2] += layer.k_sum.size() * sizeof(float);
+            out[3] += layer.k_sum.capacity() * sizeof(float);
+        }
+        return out;
+    }
+
     uint64_t nvme_bytes_written() const;
     uint64_t nvme_syscalls() const;
     uint64_t nvme_wait_ns() const;

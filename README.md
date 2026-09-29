@@ -94,6 +94,8 @@ The locally converted IQ4 MTP-Q4_0 main model does not yet have a project-provid
 download link in this release; use your prepared file or the optional quantizer.
 The recipes and conversion commands below document the historical tested setup.
 
+Experimental [selective KV refresh](docs/selective-kv-refresh.md) is available with `--kvmem-blend-ratio 0.1`. It refreshes selected history before Query Replay; the default remains disabled.
+
 ## Clone, patch, build
 
 Building uses a C++17 compiler, CMake and **CUDA Toolkit 13.2 Update 2 (nvcc 13.2.86) or newer**. The Linux startup scripts use Python 3.10+ and `ss` (iproute2).

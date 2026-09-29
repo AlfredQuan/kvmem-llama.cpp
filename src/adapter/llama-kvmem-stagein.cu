@@ -38,7 +38,7 @@ struct CopyOp {
 };
 static_assert(sizeof(CopyOp) == 24, "CopyOp");
 
-enum ItemKind { ITEM_K = 0, ITEM_V = 1 };
+enum ItemKind { ITEM_K = 0, ITEM_V = 1, ITEM_MIX = 2 };
 
 struct Item {
     size_t     off    = 0;
@@ -53,6 +53,7 @@ struct Item {
     int        n_embd_head = 0;
     int        n_rot_rope = 0;
     int32_t    pos0   = 0;
+    float      alpha  = 1;
 };
 
 struct Stage {
@@ -193,6 +194,25 @@ __global__ void quant_q8_0(const float * x, block_q8_0 * y, int64_t n_blocks) {
     for (int j = 0; j < QK8_0; ++j) {
         y[i].qs[j] = (int8_t) roundf(src[j] * id);
     }
+}
+
+__global__ void mix_f16(const half * old, half * dst, int64_t n, float alpha) {
+    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) dst[i] = __float2half((1-alpha)*__half2float(old[i]) + alpha*__half2float(dst[i]));
+}
+
+__global__ void mix_q8_0(const block_q8_0 * old, block_q8_0 * dst, int64_t n, float alpha) {
+    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    const float a = (1-alpha)*__half2float(old[i].d), b = alpha*__half2float(dst[i].d);
+    float values[QK8_0], maximum = 0;
+    for (int j = 0; j < QK8_0; ++j) {
+        values[j] = a*old[i].qs[j] + b*dst[i].qs[j];
+        maximum = fmaxf(maximum, fabsf(values[j]));
+    }
+    const float d = maximum/127.0f, inv = d ? 1.0f/d : 0;
+    dst[i].d = __float2half(d);
+    for (int j = 0; j < QK8_0; ++j) dst[i].qs[j] = (int8_t) roundf(values[j]*inv);
 }
 
 __global__ void quant_q4_0(const float * x, block_q4_0 * y, int64_t n_blocks) {
@@ -695,6 +715,16 @@ bool kvmem_stagein_flush(int64_t * copy_us, int64_t * rope_us,
     bool ok = true;
     for (const Item & it : g_st.items) {
         uint8_t * src = g_st.dev_q + it.off;
+        if (it.kind == ITEM_MIX) {
+            const int64_t n = it.nbytes / (it.ty == GGML_TYPE_F16 ? sizeof(half) : sizeof(block_q8_0));
+            if (it.ty == GGML_TYPE_F16) {
+                mix_f16<<<(n+255)/256, 256, 0, stream()>>>((const half *) src, (half *) it.dst, n, it.alpha);
+            } else {
+                mix_q8_0<<<(n+255)/256, 256, 0, stream()>>>((const block_q8_0 *) src, (block_q8_0 *) it.dst, n, it.alpha);
+            }
+            if (!(ok = cuda_ok(cudaGetLastError(), "mix packed KV"))) break;
+            continue;
+        }
         if (it.kind == ITEM_V) {
             const int64_t t0 = ggml_time_us();
             ok = cuda_ok(kvmem_copy_async(it.dst, src, it.nbytes,
@@ -838,6 +868,20 @@ bool kvmem_stagein_enqueue_v(const void * packed, size_t nbytes, uint8_t * dst,
     it.kind = ITEM_V;
     g_st.items.push_back(it);
     g_st.used += nbytes;
+    return true;
+}
+
+bool kvmem_stagein_enqueue_mix(ggml_type ty, const void * original, size_t nbytes,
+                               uint8_t * dst, float alpha) {
+    if (!std::isfinite(alpha) || alpha < 0 || alpha > 1 ||
+            (ty != GGML_TYPE_F16 && ty != GGML_TYPE_Q8_0) ||
+            nbytes % (ty == GGML_TYPE_F16 ? sizeof(half) : sizeof(block_q8_0))) return false;
+    if (alpha == 1) return true;
+    if (!kvmem_stagein_enqueue_v(original, nbytes, dst, nullptr)) return false;
+    auto & it = g_st.items.back();
+    it.kind = alpha == 0 ? ITEM_V : ITEM_MIX;
+    it.ty = ty;
+    it.alpha = alpha;
     return true;
 }
 
