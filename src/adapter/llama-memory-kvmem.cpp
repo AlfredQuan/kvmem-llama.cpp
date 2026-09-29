@@ -216,7 +216,14 @@ void llama_memory_kvmem::set_recurrent(llama_memory_recurrent * recr) {
 }
 
 bool llama_memory_kvmem::gdn_replay_enabled() const {
+#if defined(KVMEM_GPU_BACKEND_HOST)
+    // The Gated DeltaNet replay kernel lives in ggml-cuda and has no host
+    // equivalent. Report it as unavailable so callers recompute the hybrid
+    // state instead of calling a device entry point that does not exist.
+    return false;
+#else
     return gdn_replay_ != nullptr;
+#endif
 }
 
 bool llama_memory_kvmem::gdn_replay_begin(llama_pos start, uint32_t width) {
@@ -225,6 +232,13 @@ bool llama_memory_kvmem::gdn_replay_begin(llama_pos start, uint32_t width) {
 
 bool llama_memory_kvmem::gdn_replay_commit(llama_context * ctx, uint32_t n_keep) {
     if (!gdn_replay_ || !recr_->replay_recording || n_keep > recr_->replay_width) return false;
+#if defined(KVMEM_GPU_BACKEND_HOST)
+    // See gdn_replay_enabled(): no device replay kernel on this backend.
+    (void) ctx;
+    recr_->replay_poisoned = true;
+    recr_->replay_finish(0);
+    return false;
+#else
     llama_synchronize(ctx);
     auto & replay = *gdn_replay_;
     const int64_t started = ggml_time_us();
@@ -251,6 +265,7 @@ bool llama_memory_kvmem::gdn_replay_commit(llama_context * ctx, uint32_t n_keep)
     replay.fold_us += ggml_time_us() - started;
     replay.folds += n_keep != 0;
     return true;
+#endif  // !KVMEM_GPU_BACKEND_HOST
 }
 static std::atomic<uint64_t> transfer_bytes[3]{};
 static std::atomic<uint64_t> transfer_calls[3]{};
