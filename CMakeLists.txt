@@ -189,7 +189,7 @@ if (KVMEM_BUILD_LLAMA)
     # Default llama.cpp FA vec kernels are only F16/Q4_0/Q8_0/BF16. q5_0 KV
     # (and q4_1/q5_1) need this or FlashAttention refuses those types and
     # Qwen3.8 hybrid prefill collapses (~75 t/s vs ~500).
-    set(GGML_CUDA_FA_ALL_QUANTS ON CACHE BOOL
+    set(GGML_CUDA_FA_QUANTS "all" CACHE STRING
         "compile all FlashAttention KV quants (needed for --kv-dtype q5_0)" FORCE)
     set(LLAMA_KVMEM ON CACHE BOOL "" FORCE)
     set(LLAMA_KVMEM_ROOT "${CMAKE_SOURCE_DIR}" CACHE PATH "" FORCE)
