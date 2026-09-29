@@ -8,7 +8,7 @@
 
 llama.cpp inference with tiered KV memory for long-running agents.
 
-**KVMem** adds a bounded GPU KV working set, host-memory storage and query-based retrieval to [llama.cpp](https://github.com/ggml-org/llama.cpp). llama.cpp handles model loading, inference, quantization and MTP. The separate `llama-kvmem-server` provides OpenAI-compatible chat, tools and optional vision. **NVMe offload is not implemented.**
+**KVMem** adds a bounded GPU KV working set, host-memory storage and query-based retrieval to [llama.cpp](https://github.com/ggml-org/llama.cpp). llama.cpp handles model loading, inference, quantization and MTP. The separate `llama-kvmem-server` provides OpenAI-compatible chat, tools and optional vision. This source version also supports opt-in NVMe snapshots for inactive sessions; the rc3 prebuilts listed below predate that feature.
 
 This port supports **Qwen3.8-27B GGUF quants**, including IQ3 and IQ4. The sibling [kvmem-qw3](https://github.com/kvmem/kvmem-qw3) is a CUDA-native runtime focused on Q8, primarily tested on RTX PRO 6000.
 
@@ -22,11 +22,11 @@ KVMem retrieves relevant historical blocks into a bounded GPU window, limiting t
 
 **Performance on faster GPUs.** Our measurements use the RTX 5060 Ti, the entry-level 16 GB option in the desktop RTX 50 series. The 16 GB RTX 5070 Ti and RTX 5080 offer substantially more compute and roughly twice the memory bandwidth ([NVIDIA specifications](https://www.nvidia.com/en-us/geforce/graphics-cards/compare/)). We therefore expect substantially faster GPU prefill and decode on these cards. Actual gains depend on the workload, CPU and host-memory transfers; benchmarks on these GPUs are welcome.
 
-Current milestone: [`v0.16.0-rc3`](docs/milestones/v0.16.0-rc3.md) (pre-release).
+Previous milestone: [`v0.16.0-rc3`](docs/milestones/v0.16.0-rc3.md) (pre-release).
 
 **Limitation:** one generation cannot exceed `--kvmem-gen-reserve` (16384 tokens on the IQ3 recipe, 12288 on IQ4), including thinking. Retrieval pins the GPU window; new tokens only use those reserved slots. We are working on fixing this. For agent use, add a line to the system prompt such as: *Keep each turn's output, including thinking, within 16384 tokens* (use 12288 on IQ4). That makes oversized single-turn replies much less likely.
 
-Version: **0.16.0-rc3**. See the [English / 中文 release notes](docs/releases/v0.16.0-rc3.md) for CUDA build choices and measured results.
+Source version: **0.17.0**. See the [English / 中文 release notes](docs/releases/v0.17.0.md) for the core changes. The prebuilt downloads below are older rc3/beta 2 packages, not v0.17.0 binaries.
 
 ## How KVMem works
 
@@ -42,11 +42,20 @@ Core flags (what the 16 GiB recipes still pass):
 | `--kvmem-budget` | How many historical tokens retrieval may keep on GPU. |
 | `--kvmem-sink-tokens N` | Server and CLI: always keep the prefix in the GPU working set. Default `0` keeps one block (not disabled). Positive values round down to whole blocks, with a minimum of one block. For example, with block size 128, `1024` keeps 1024 tokens and `129` keeps 128. These blocks count toward `--kvmem-budget`. |
 | `--kvmem-gen-reserve` | GPU slots reserved for new tokens so retrieval cannot fill the pool. **One generation cannot exceed this length** (including thinking). |
+| `--kvmem-conversations N` | How many conversations retain their KV in host RAM or the optional session disk cache. Default `1` reproduces earlier behavior, where a different conversation discards the previous one. Higher values let the server switch between conversations without reprocessing them; requests are still served one at a time. Needs flash attention. |
+| `--kvmem-conversations-gb GB` | Soft cap on accounted RAM summed over active and inactive sessions. Move inactive sessions to NVMe by LRU when enabled, or evict them when RAM-only; an oversized active session continues with a warning. Default `0` means no byte cap. Requires `--kvmem-conversations N` with `N > 1`. |
+| `--kvmem-session-ram-gb GB` | Alias for the total active + inactive session RAM **soft** cap. Active KV may exceed it; idle KV moves to NVMe by LRU when enabled. `0` remains unlimited. |
+| `--kvmem-session-nvme-gb GB` | Enable disk storage for inactive sessions with this total quota. RAM pressure spills sessions to disk; disk pressure discards them by LRU. Default `0` disables it. |
+| `--kvmem-session-cache-dir PATH` | Directory on your NVMe/SSD for the session files; required when session disk caching is enabled. |
 | `--kv-dtype` | Sets the same cache type for **main** attention K and V (IQ3 q8_0, IQ4 q5_0). Use `-ctk q8_0 -ctv q4_0` for mixed precision. |
 | `--spec-type draft-mtp` | Enable multi-token prediction. |
 | `--mmproj` | Vision projector GGUF. Omit for text-only. |
 
 KVMem retrieval is on by default, with 128-token blocks, query replay `auto`, query policy `user`, MTP draft length 3, F16 draft KV, and ReplaySSM. You do not need to pass those unless you are overriding them. GPU KV size is `budget + gen_reserve`. When history exceeds `--kvmem-budget`, retrieval picks blocks for the current last-user query. Clients should send the full `messages` history each turn.
+
+With `--kvmem-conversations` above 1, that history is also the conversation's identity: no client API change and no conversation id are required. A request that continues a stored conversation extends it, while a request that only shares a system prompt or chat template starts a separate one instead of truncating the stored tail. A match is usable only when a recurrent checkpoint exists at or before it; otherwise the request is an ordinary cache miss. Details and limits are in [Multi-conversation KV cache](docs/multi-conversation-kv-cache.md).
+
+For example, add `--kvmem-conversations 3 --kvmem-session-ram-gb 12 --kvmem-session-nvme-gb 40 --kvmem-session-cache-dir D:/KVMem/session-cache` to retain sessions across RAM and disk. The active session must fit the machine's actual RAM. A new server run reclaims marked, unlocked cache directories left by earlier runs, while preserving live servers' caches. Legacy directories without a marker and files that fail deletion need manual attention. See [Session disk cache](docs/session-disk-cache.md) for accounting and recovery, the [1:10 multi-session stability test](docs/session-exchange-stability.md) for the large exchange check, and the [three-session 5 GiB K8/V4 test](docs/three-session-5g-k8v4-stability.md) for a real-model 10 GiB NVMe and cold-prefill comparison.
 
 ## How KVMem attaches to llama.cpp
 
@@ -60,7 +69,7 @@ Do **not** commit a dirty `llama.cpp` working tree. The submodule pointer is the
 - RTX 5060 Ti with 16 GiB VRAM; Intel Core Ultra 7 255H and 32 GiB RAM (19.53 GiB visible to WSL2).
 - CMake 4.4.3 and CUDA 13.2.86.
 
-The project builds on llama.cpp's CUDA backend, with the platform above used for our measurements. Reports of successful runs, benchmarks and issues on other NVIDIA GPUs and systems are welcome. AMD/ROCm and Metal backends would need integration work.
+The CUDA measurements above use the listed NVIDIA platform. Experimental AMD/ROCm builds for Windows and Linux/WSL2 are documented in the [ROCm guide](docs/rocm.md). Metal integration is not included.
 
 ## Prebuilt downloads
 
@@ -95,12 +104,12 @@ Building uses a C++17 compiler, CMake and **CUDA Toolkit 13.2 Update 2 (nvcc 13.
 
 Check `nvcc --version` for the compiler selected by CMake; `release 13.2` alone is insufficient, and the CUDA version shown by `nvidia-smi` describes driver support. After upgrading the Toolkit, configure a **new build directory** and rebuild the binaries. Updating the driver or replacing CUDA DLLs does not fix CUDA kernels already compiled into an old binary.
 
-An experimental [native Windows build](scripts/windows/README.md) is being validated. It disables NVMe storage and includes PowerShell launchers; the performance results below remain Linux/WSL2 measurements.
+The [native Windows CUDA build](scripts/windows/README.md) disables the legacy raw-block NVMe tier and includes PowerShell launchers; the session snapshot cache described above is independent of that build option. The performance results below remain Linux/WSL2 measurements.
 
 ```bash
 git clone --recurse-submodules https://github.com/kvmem/kvmem-llama.cpp.git
 cd kvmem-llama.cpp
-git checkout v0.16.0-rc3
+git checkout v0.17.0
 git submodule update --init
 scripts/apply-patches.sh
 scripts/build-cuda.sh
@@ -149,20 +158,32 @@ yet accept every `llama-server` option.
 | `-np`, `--parallel` | Only `1` is supported. Automatic or multiple slots produce an error. |
 | `-to`, `--timeout` | HTTP read/write timeout in seconds; KVMem retains its 1800-second default. |
 | `--threads-http` | HTTP worker count; <= 0 selects automatically. This does not enable parallel inference slots. |
-| `-dev`, `--device`; `--list-devices` | Select one offload device (for example `CUDA0`), or `none` for CPU; list devices without loading a model. |
-| `-mg`, `--main-gpu`; `-sm`, `--split-mode` | Select a single GPU using `--split-mode none --main-gpu INDEX`. `layer` is accepted only when offloading to at most one device. |
-| `-ts`, `--tensor-split` | A single proportion is accepted; multi-device proportions are rejected. |
+| `-dev`, `--device`; `--list-devices` | Select one device or an explicit CUDA list such as `CUDA0,CUDA1`; `none` selects CPU. List devices without loading a model. |
+| `-mg`, `--main-gpu`; `-sm`, `--split-mode` | Experimental CUDA multi-GPU supports `layer` or `tensor` with `--gpu-layers all`. `none` remains available for one GPU. |
+| `-ts`, `--tensor-split` | Split proportions, with one value for each explicitly selected GPU. |
+| `-mmdev`, `--mmproj-device` | Select the vision projector's device independently of the language model; `none` places it on CPU. |
 
 Additional upstream aliases: `--usage` = `--help`, `--predict` = `--n-predict`,
 `-s` = `--seed`, `-mm` = `--mmproj`, `--no-webui` = `--no-ui`, and
 `--path` = `--ui-dir`.
 
-**Multi-GPU operation is not supported yet**, including with `--no-kvmem`.
-Multiple `--device` names, multiple `--tensor-split` entries, and `row`/`tensor`
-split modes fail before model loading. When automatic discovery sees multiple
-GPUs, select one with `--device CUDA0`, use `--split-mode none --main-gpu INDEX`,
-or expose one GPU through `CUDA_VISIBLE_DEVICES`. Indices refer to the visible
-device list (and to the selected device list when `--device` is supplied).
+The experimental CUDA layer path is opt-in. For example:
+
+```powershell
+.\llama-kvmem-server.exe --model C:\models\model.gguf --device CUDA0,CUDA1 --split-mode layer --tensor-split 2,1 --gpu-layers all --spec-type none --kvmem-budget 32768
+```
+
+Use `--list-devices` to obtain device names; the example budget must fit every
+owning GPU. A multi-GPU request requires CUDA devices, full layer offload and
+`--split-mode layer` or `tensor`. KVMem capture and KV layout use a synchronous
+backend path for correctness. On two GPUs, embedded `nextn` MTP is experimental.
+Layer mode requires an explicit `--kvmem-mtp-state snapshots` or `replay`;
+tensor mode supports `snapshots` only. `auto` and independent draft models are
+not supported for multi-GPU MTP. Row split remains unsupported. See the
+[layer guide](docs/multi-gpu-layer.md) and [tensor guide](docs/multi-gpu-tensor.md).
+Automatic discovery still requires an explicit choice when several GPUs are
+present. Indices refer to the visible device list (and to the selected list
+when `--device` is supplied). Single-GPU defaults remain unchanged.
 
 Threads, physical batch size and Flash Attention settings propagate to MTP.
 Existing model, host/port, context, sampling, chat-template, vision and KV-cache
@@ -195,10 +216,13 @@ key and return HTTP 401 otherwise. Health checks, CORS preflights and mounted UI
 assets remain public. Loading the UI does not grant access to authenticated APIs;
 clients must supply the key. Without key flags, authentication remains disabled.
 
-Regression checks: `kvmem-server-options-test` via CTest, and
+Regression checks: `kvmem-server-options-test` and
+`kvmem-conversation-store-test` via CTest, and
 `python scripts/test_server_compat.py --server /path/to/llama-kvmem-server`.
 Add `--model PATH` for live auth/inference checks, `--mtp` for MTP, and
 `--mmproj PATH --image PATH` for the optional vision fixture containing `6037`.
+Interleaved conversations need a model of their own:
+`python scripts/test_server_conversations.py --server PATH --model PATH --output DIR`.
 
 ### Environment variables and startup diagnostics
 
@@ -215,7 +239,7 @@ A CLI key does not revoke an environment key.
 | `LLAMA_ARG_MODEL`, `LLAMA_ARG_ALIAS` | Model path and API model name |
 | `LLAMA_ARG_HOST`, `LLAMA_ARG_PORT`, `LLAMA_ARG_TIMEOUT`, `LLAMA_ARG_THREADS_HTTP` | HTTP server |
 | `LLAMA_ARG_CTX_SIZE`, `LLAMA_ARG_N_PREDICT`, `LLAMA_ARG_BATCH`, `LLAMA_ARG_UBATCH`, `LLAMA_ARG_THREADS` | Context, output and CPU/batch configuration |
-| `LLAMA_ARG_DEVICE`, `LLAMA_ARG_N_GPU_LAYERS`, `LLAMA_ARG_MAIN_GPU`, `LLAMA_ARG_SPLIT_MODE`, `LLAMA_ARG_TENSOR_SPLIT` | GPU selection; the same single-GPU restrictions apply |
+| `LLAMA_ARG_DEVICE`, `LLAMA_ARG_N_GPU_LAYERS`, `LLAMA_ARG_MAIN_GPU`, `LLAMA_ARG_SPLIT_MODE`, `LLAMA_ARG_TENSOR_SPLIT` | GPU selection; the same CUDA layer/tensor multi-GPU restrictions apply |
 | `LLAMA_ARG_FLASH_ATTN`, `LLAMA_ARG_CACHE_TYPE_K`, `LLAMA_ARG_CACHE_TYPE_V`, `LLAMA_ARG_N_PARALLEL` | Attention, KV types and single-slot configuration |
 | `LLAMA_ARG_LOAD_MODE`, `LLAMA_ARG_MMAP`, `LLAMA_ARG_MLOCK` | Model loading; legacy environment options apply before `LOAD_MODE` |
 | `LLAMA_ARG_MMPROJ`, `LLAMA_ARG_MMPROJ_OFFLOAD`, `LLAMA_ARG_IMAGE_MIN_TOKENS`, `LLAMA_ARG_IMAGE_MAX_TOKENS` | Vision |
@@ -471,6 +495,7 @@ progress-reporting approach from [PR #9](https://github.com/kvmem/kvmem-llama.cp
 - `GET /health`
 - `GET /v1/models`
 - `POST /v1/chat/completions` (sampling, stream, tools, optional images)
+- `POST /v1/responses` and `POST /responses` (OpenAI Responses, non-streaming and SSE streaming). With `--mmproj`, `input_image.image_url` accepts image URLs or Base64 data URLs through the same vision pipeline as Chat Completions. File IDs are not supported. The per-request `detail` value is ignored; image resolution is controlled by the server's image token settings. `scripts/test_responses_sdk.py` exercises both paths through the official OpenAI Python SDK, whose Responses stream parser is stricter than a hand-rolled client.
 
 No auth or TLS unless an API key is set. Binds `127.0.0.1` by default. To serve
 on the LAN, pass `--host 0.0.0.0` to the server or to the launchers
@@ -489,12 +514,14 @@ Native TLS is not supported. Stream `usage` includes
 ## Documentation
 
 - [v0.16.0-rc3 milestone](docs/milestones/v0.16.0-rc3.md)
+- [v0.17.0 release notes (English / 中文)](docs/releases/v0.17.0.md)
 - [Modification plan](docs/modification-plan.md)
 - [Architecture](docs/architecture.md)
 - [Patch replay](patches/README.md)
 - [Recommended 16 GiB performance](docs/recommended-config-performance.md)
 - [256K tool benchmark](docs/long-context-benchmark-2026-09-14.md)
 - [Query replay](docs/query-replay-implementation-report-2026-09-14.md)
+- [Multi-conversation KV cache](docs/multi-conversation-kv-cache.md)
 - [Multimodal usage](docs/multimodal-implementation-report-2026-09-14.md)
 - Native Qwen engine: [kvmem/kvmem-qw3](https://github.com/kvmem/kvmem-qw3)
 

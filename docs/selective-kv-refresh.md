@@ -70,7 +70,9 @@ refreshed rows' forward trajectory or the recurrent-state update. `alpha=0`
 still runs refresh, then copies the original KV bytes back exactly. In the
 default `carry` mode it also advances recurrent state, so it is a diagnostic
 control, not equivalent to ratio `0`.
-Weighted refresh currently supports CUDA F16/Q8_0 caches. Q8 operands are
+Weighted refresh currently supports single-GPU CUDA F16/Q8_0 caches. A
+multi-GPU cache with `alpha < 1` is rejected before refresh because the mixing
+scratch is device-local. Q8 operands are
 dequantized numerically, interpolated, and requantized, never mixed as bytes.
 The existing transfer slab supplies original CPU bytes, without a second GPU
 backup or a GPU-to-CPU readback of refreshed KV.
