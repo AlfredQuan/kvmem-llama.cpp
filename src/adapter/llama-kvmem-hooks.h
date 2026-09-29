@@ -136,6 +136,8 @@ struct llama_kvmem_transfer_stats {
     uint64_t calls[3] = {};
 };
 LLAMA_API llama_kvmem_transfer_stats llama_kvmem_get_transfer_stats();
+// GPU main/draft KV capacity, then host KV payload/capacity and index payload/capacity.
+LLAMA_API std::vector<uint64_t> llama_kvmem_benchmark_memory();
 void kvmem_record_transfer(int cuda_kind, uint64_t bytes);
 struct llama_kvmem_turn_spans {
     std::vector<llama_kvmem_row_range> query;

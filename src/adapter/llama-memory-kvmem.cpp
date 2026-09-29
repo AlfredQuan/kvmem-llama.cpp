@@ -1517,6 +1517,26 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_memory_kvmem::memory_breakdow
     return kv_->memory_breakdown();
 }
 
+std::vector<uint64_t> llama_memory_kvmem::benchmark_memory() const {
+    std::vector<uint64_t> out(6, 0);
+    for (const auto & entry : kv_->memory_breakdown()) out[0] += entry.second;
+    if (raw_) {
+        const auto host = raw_->benchmark_bytes();
+        for (size_t i = 0; i < host.size(); ++i) out[i + 2] += host[i];
+    }
+    if (mtp_) {
+        for (const auto & entry : mtp_->memory_breakdown()) out[1] += entry.second;
+        const auto host = mtp_->benchmark_host_bytes();
+        for (size_t i = 0; i < host.size(); ++i) out[i + 2] += host[i];
+    }
+    return out;
+}
+
+std::vector<uint64_t> llama_kvmem_benchmark_memory() {
+    const auto * memory = kvmem_capture_active();
+    return memory ? memory->benchmark_memory() : std::vector<uint64_t>(6, 0);
+}
+
 void llama_memory_kvmem::state_write(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) const {
     kv_->state_write(io, seq_id, flags);
 }
